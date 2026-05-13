@@ -1,6 +1,14 @@
 """
 src/data/feature_engineer.py
 Reads raw synthetic IO data and engineers ML-ready features.
+
+Blueprint Requirements (Page 7, Section 1.3-1.4):
+- Rolling window features (1min, 5min, 15min, 1hr)
+- Rate of change features (delta and percentage change)
+- IO size entropy, latency jitter, lag features
+- Capacity burn rate
+- Cyclical time encodings (sin/cos for hour and day_of_week)
+
 Input  : data/synthetic/io_workload_data.parquet
 Output : data/processed/io_features.parquet
          data/processed/io_features.csv
@@ -21,90 +29,276 @@ LABEL_MAP = {
 
 
 def load_raw_data(path: str = "data/synthetic/io_workload_data.parquet") -> pd.DataFrame:
-    """Load raw synthetic data from parquet."""
+    """
+    Load raw synthetic data from parquet.
+    Handles both single-file and partitioned parquet formats.
+    """
     print(f"Loading raw data from {path} ...")
-    df = pd.read_parquet(path)
+    df = pd.read_parquet(path)  # PyArrow automatically handles partitioned directories
     print(f"Loaded {len(df):,} rows, {df.shape[1]} columns.")
+    return df
+
+
+def clean_raw_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Basic cleaning before feature engineering.
+    - Remove duplicates
+    - Ensure timestamp is datetime
+    - Forward-fill numeric gaps per volume (no backfill to avoid leakage)
+    """
+    df = df.drop_duplicates().copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+
+    # Sort once for all time-series operations
+    df = df.sort_values(["volume_id", "timestamp"]).reset_index(drop=True)
+
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    df[num_cols] = df.groupby("volume_id", sort=False, observed=True)[num_cols].ffill()
+    df[num_cols] = df[num_cols].fillna(0)
+
+    return df
+
+
+def engineer_basic_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create basic derived features from raw IO metrics.
+    """
+    # 1. IOPS per queue depth (efficiency)
+    df["iops_per_queue"] = (df["total_iops"] / df["queue_depth"]).round(4)
+
+    # 2. Total throughput
+    df["total_throughput_mbps"] = (df["read_throughput_mbps"] + df["write_throughput_mbps"]).round(2)
+
+    # 3. Write pressure (1 - read_write_ratio)
+    df["write_pressure"] = (1 - df["read_write_ratio"]).round(4)
+
+    # 4. Latency jitter (p99 - p50) for reads and writes
+    df["read_latency_jitter"] = (df["read_latency_p99_us"] - df["read_latency_p50_us"]).round(2)
+    df["write_latency_jitter"] = (df["write_latency_p99_us"] - df["write_latency_p50_us"]).round(2)
+
+    # 5. Average latency (mean of p50)
+    df["avg_latency_us"] = ((df["read_latency_p50_us"] + df["write_latency_p50_us"]) / 2).round(2)
+
+    # 6. IOPS to latency performance score
+    df["iops_latency_score"] = (df["total_iops"] / (df["avg_latency_us"] + 1)).round(4)
+
+    # 7. Capacity burn rate (GB per day)
+    df["capacity_burn_rate"] = (
+        df.groupby("volume_id", sort=False, observed=True)["capacity_used_gb"]
+        .diff()            # GB gained since last minute
+        .fillna(0)
+        * 1440            # scale to GB/day (1440 min/day)
+    )
+
+    # 8. Capacity headroom (remaining capacity)
+    df["capacity_headroom_gb"] = (df["capacity_total_gb"] - df["capacity_used_gb"]).round(2)
+
+    return df
+
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add time-based features with cyclical encoding.
+    Blueprint requirement: hour, day_of_week, is_weekend, sin/cos encodings
+    """
+    # Extract time components
+    df["hour"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek  # 0=Monday, 6=Sunday
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+    df["day_of_month"] = df["timestamp"].dt.day
+    
+    # Cyclical encoding for hour (0-23)
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24).round(4)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24).round(4)
+    
+    # Cyclical encoding for day_of_week (0-6)
+    df["day_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7).round(4)
+    df["day_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7).round(4)
+    
+    return df
+
+
+def add_io_size_entropy(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add IO size entropy per volume per hour to capture randomness signature.
+    """
+    if "io_size_avg_kb" not in df.columns:
+        return df
+
+    df["hour_bucket"] = df["timestamp"].dt.floor("h")
+
+    counts = (
+        df.groupby(["volume_id", "hour_bucket", "io_size_avg_kb"], sort=False, observed=True)
+        .size()
+        .rename("count")
+        .reset_index()
+    )
+    counts["prob"] = counts["count"] / counts.groupby(
+        ["volume_id", "hour_bucket"], sort=False, observed=True
+    )["count"].transform("sum")
+    counts["entropy_component"] = np.where(
+        counts["prob"] > 0,
+        -counts["prob"] * np.log2(counts["prob"]),
+        0.0,
+    )
+
+    entropy_df = (
+        counts.groupby(["volume_id", "hour_bucket"], sort=False, observed=True)["entropy_component"]
+        .sum()
+        .rename("io_size_entropy")
+        .reset_index()
+    )
+
+    df = df.merge(entropy_df, on=["volume_id", "hour_bucket"], how="left", sort=False)
+    df = df.drop(columns=["hour_bucket"])
+
+    return df
+
+
+def add_rolling_window_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add rolling window features (1min, 5min, 15min, 1hr).
+    Rolling mean and std for key metrics over windows.
+    
+    Note: This is computationally expensive for 2M+ rows.
+    We'll compute for key metrics only.
+    """
+    print("  Computing rolling window features (this may take a while)...")
+    
+    # Define windows (in minutes)
+    windows = [5, 15, 60]  # 5min, 15min, 1hr
+    
+    # Metrics to compute rolling features for
+    metrics = ["total_iops", "avg_latency_us", "total_throughput_mbps"]
+    
+    for window in windows:
+        for metric in metrics:
+            # Rolling mean
+            df[f"{metric}_roll_{window}m_mean"] = (
+                df.groupby("volume_id", sort=False, observed=True)[metric]
+                .rolling(window=window, min_periods=1)
+                .mean()
+                .reset_index(level=0, drop=True)
+                .round(2)
+            )
+            
+            # Rolling std
+            df[f"{metric}_roll_{window}m_std"] = (
+                df.groupby("volume_id", sort=False, observed=True)[metric]
+                .rolling(window=window, min_periods=1)
+                .std()
+                .reset_index(level=0, drop=True)
+                .fillna(0)
+                .round(2)
+            )
+    
+    return df
+
+
+def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add lag features (previous values at lags 1, 5, 15, 60 minutes).
+    Blueprint requirement: lag features for time-series patterns.
+    """
+    print("  Computing lag features...")
+    
+    # Lag periods (in minutes)
+    lags = [1, 5, 15, 60]
+    
+    # Metrics to lag
+    metrics = ["total_iops", "avg_latency_us", "capacity_used_pct"]
+    
+    for lag in lags:
+        for metric in metrics:
+            df[f"{metric}_lag_{lag}m"] = (
+                df.groupby("volume_id", sort=False, observed=True)[metric]
+                .shift(lag)
+                .fillna(0)
+                .round(2)
+            )
+    
+    return df
+
+
+def add_rate_of_change_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add rate of change features (delta and percentage change).
+    Blueprint requirement: delta (current - previous) and % change per metric.
+    """
+    print("  Computing rate of change features...")
+    
+    # Metrics to compute rate of change
+    metrics = ["total_iops", "avg_latency_us", "capacity_used_pct"]
+    
+    for metric in metrics:
+        # Delta (current - previous)
+        df[f"{metric}_delta"] = (
+            df.groupby("volume_id", sort=False, observed=True)[metric]
+            .diff()
+            .fillna(0)
+            .round(2)
+        )
+        
+        # Percentage change
+        df[f"{metric}_pct_change"] = (
+            df.groupby("volume_id", sort=False, observed=True)[metric]
+            .pct_change()
+            .fillna(0)
+            .replace([np.inf, -np.inf], 0)
+            .round(4)
+        )
+    
     return df
 
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create derived features from raw IO metrics.
-
-    Feature logic:
-    ─────────────────────────────────────────────────────────────────────────
-    iops_per_queue          → IOPS efficiency per queue slot.
-                              High = DB_OLTP (many IOs, few queues)
-                              Low  = Backup  (few IOs, small queues)
-
-    bytes_per_io_kb         → Average size of each IO operation in KB.
-                              throughput(MB/s) × 1024 / iops = KB per IO
-                              High = Backup/AI_Training (large sequential IOs)
-                              Low  = DB_OLTP (tiny 4KB random IOs)
-
-    write_pressure          → How write-heavy is this workload.
-                              1 - read_ratio
-                              High = Backup (90% writes)
-                              Low  = AI_Training (92% reads)
-
-    latency_bandwidth_ratio → Latency cost per MB/s of throughput.
-                              latency_us / throughput_mbps
-                              High = Backup (high latency, high throughput)
-                              Low  = DB_OLTP (low latency, moderate throughput)
-
-    disk_pressure_score     → Combined disk stress indicator.
-                              (disk_util_pct × latency_us) / 1000
-                              High = AI_Training + Backup
-                              Low  = VM + AI_Inference
-
-    throughput_efficiency   → How much throughput per % disk utilization.
-                              throughput_mbps / disk_util_pct
-                              High = AI_Training (massive throughput, high util)
-                              Low  = DB_OLTP (modest throughput, moderate util)
-
-    iops_latency_score      → Performance score: more IOPS, less latency = better.
-                              iops / latency_us
-                              High = DB_OLTP (high IOPS, low latency)
-                              Low  = Backup  (low IOPS, high latency)
-    ─────────────────────────────────────────────────────────────────────────
+    Master feature engineering pipeline.
+    Combines all feature engineering steps.
     """
-    df = df.copy()
+    print("\nEngineering features...")
+    
+    # 0. Clean data and ensure sorted order
+    print("  Step 0/7: Cleaning raw data...")
+    df = clean_raw_data(df)
 
-    # 1. IOPS per queue depth
-    df["iops_per_queue"] = (df["iops"] / df["queue_depth"]).round(4)
+    # 1. Basic derived features
+    print("  Step 1/7: Basic derived features...")
+    df = engineer_basic_features(df)
+    
+    # 2. Time-based features
+    print("  Step 2/7: Time-based features...")
+    df = add_time_features(df)
 
-    # 2. Average IO size in KB (throughput MB/s → KB/s ÷ IOPS = KB per IO)
-    df["bytes_per_io_kb"] = (
-        (df["throughput_mbps"] * 1024) / df["iops"]
-    ).round(4)
-
-    # 3. Write pressure (inverse of read ratio)
-    df["write_pressure"] = (1 - df["read_ratio"]).round(4)
-
-    # 4. Latency cost per unit of throughput
-    df["latency_bandwidth_ratio"] = (
-        df["latency_us"] / df["throughput_mbps"]
-    ).round(4)
-
-    # 5. Combined disk stress score
-    df["disk_pressure_score"] = (
-        (df["disk_util_pct"] * df["latency_us"]) / 1000
-    ).round(4)
-
-    # 6. Throughput efficiency per % disk utilization
-    df["throughput_efficiency"] = (
-        df["throughput_mbps"] / df["disk_util_pct"]
-    ).round(4)
-
-    # 7. IOPS to latency performance score
-    df["iops_latency_score"] = (
-        df["iops"] / df["latency_us"]
-    ).round(4)
-
-    # 8. Encode workload_type text → integer label for ML
+    # 3. IO size entropy
+    print("  Step 3/7: IO size entropy...")
+    df = add_io_size_entropy(df)
+    
+    # 4. Rolling window features (expensive!)
+    print("  Step 4/7: Rolling window features...")
+    df = add_rolling_window_features(df)
+    
+    # 5. Lag features
+    print("  Step 5/7: Lag features...")
+    df = add_lag_features(df)
+    
+    # 6. Rate of change features
+    print("  Step 6/7: Rate of change features...")
+    df = add_rate_of_change_features(df)
+    
+    # 7. Encode workload_type text → integer label for ML
+    print("  Step 7/7: Label encoding...")
     df["label"] = df["workload_type"].map(LABEL_MAP)
 
+    # Downcast numeric columns to reduce memory usage
+    int_cols = df.select_dtypes(include=["int64", "int32", "int16", "int8"]).columns
+    float_cols = df.select_dtypes(include=["float64", "float32"]).columns
+    if len(int_cols) > 0:
+        df[int_cols] = df[int_cols].astype("int32")
+    if len(float_cols) > 0:
+        df[float_cols] = df[float_cols].astype("float32")
+    
     return df
 
 
@@ -120,7 +314,7 @@ def validate_features(df: pd.DataFrame) -> None:
     labels_found = sorted(df["label"].unique())
     print(f"Labels found: {labels_found}  ({'✅' if labels_found == [0,1,2,3,4] else '❌'})")
 
-    print(f"Total rows  : {len(df):,}  ({'✅' if len(df) == 500_000 else '❌'})")
+    print(f"Total rows  : {len(df):,}  ({'✅' if len(df) == 2_160_000 else '❌'})")
     print("────────────────────────────────────────────────\n")
 
 
@@ -141,13 +335,16 @@ def save_features(df: pd.DataFrame) -> None:
 def print_summary(df: pd.DataFrame) -> None:
     """Print feature summary per workload type."""
     print("\n── Feature Means per Workload Type ─────────────")
-    summary = df.groupby("workload_type")[[
+    summary_cols = [
         "iops_per_queue",
-        "bytes_per_io_kb",
         "write_pressure",
-        "disk_pressure_score",
         "iops_latency_score",
-    ]].mean().round(2)
+        "capacity_burn_rate",
+        "total_iops",
+        "avg_latency_us",
+    ]
+    available_cols = [col for col in summary_cols if col in df.columns]
+    summary = df.groupby("workload_type", observed=True)[available_cols].mean().round(2)
     print(summary.to_string())
     print("────────────────────────────────────────────────")
     print(f"\nFinal columns ({df.shape[1]}):")
@@ -155,13 +352,13 @@ def print_summary(df: pd.DataFrame) -> None:
 
 
 if __name__ == "__main__":
-    print("=" * 55)
+    print("=" * 70)
     print(" Feature Engineering Pipeline")
-    print("=" * 55)
+    print(" Blueprint-Compliant: Time-series + Rolling + Lag + Rate-of-Change")
+    print("=" * 70)
 
-    df_raw      = load_raw_data()
+    df_raw = load_raw_data()
 
-    print("\nEngineering features...")
     df_featured = engineer_features(df_raw)
 
     validate_features(df_featured)
@@ -171,3 +368,4 @@ if __name__ == "__main__":
     print_summary(df_featured)
 
     print("\n✅ Feature engineering complete!")
+    print(f"   Output: {df_featured.shape[0]:,} rows × {df_featured.shape[1]} columns")
