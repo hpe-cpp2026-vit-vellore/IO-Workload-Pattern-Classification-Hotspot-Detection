@@ -1,8 +1,12 @@
 """
 src/pipeline/preprocessor.py
 
-Loads engineered features, applies StandardScaler, and creates
-stratified 70/15/15 train/val/test splits.
+Loads engineered features, applies robust scaling, and creates
+chronological train/val/test splits.
+
+CPP3 Objectives:
+- CHRONOLOGICAL split (not random!) for time-series data
+- Scaler fitted on train only (no data leakage)
 
 Inputs  : data/processed/io_features.parquet
 Outputs : data/features/X_train.parquet  → X_val.parquet  → X_test.parquet
@@ -11,13 +15,11 @@ Outputs : data/features/X_train.parquet  → X_val.parquet  → X_test.parquet
 """
 
 import pickle
-import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).resolve().parents[2]
@@ -26,12 +28,18 @@ FEAT_DIR   = ROOT / "data" / "features"
 MODEL_DIR  = ROOT / "models"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-RANDOM_SEED  = 42
-TEST_SIZE    = 0.30   # 30% for val+test combined
-VAL_FRACTION = 0.50   # 50% of that 30% → 15% val, 15% test
+TRAIN_DAYS  = 21
+VAL_DAYS    = 4
 
-# Columns to drop before training (non-numeric / redundant)
-DROP_COLS = ["workload_type"]
+# Columns to drop before training (non-numeric / identifiers / redundant)
+DROP_COLS = [
+    "workload_type",  # Text label (we use 'label' instead)
+    "volume_id",      # Identifier (not a feature)
+    "node_id",        # Identifier (can be used for topology analysis later)
+    "pool_id",        # Identifier (can be used for topology analysis later)
+    "tier",           # Categorical (can be encoded if needed, but not for baseline)
+    "timestamp",      # Time identifier (we use derived time features instead)
+]
 LABEL_COL = "label"
 
 
@@ -42,6 +50,31 @@ def load_features(path: Path = INPUT_PATH) -> pd.DataFrame:
     print(f"  Shape : {df.shape}")
     print(f"  Columns: {list(df.columns)}")
     return df
+
+
+def split_chronological(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split chronologically into 21/4/5 days based on the dataset start date.
+    """
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    start_date = df["timestamp"].min().normalize()
+    train_end = start_date + pd.Timedelta(days=TRAIN_DAYS)
+    val_end = train_end + pd.Timedelta(days=VAL_DAYS)
+
+    train_df = df[df["timestamp"] < train_end]
+    val_df = df[(df["timestamp"] >= train_end) & (df["timestamp"] < val_end)]
+    test_df = df[df["timestamp"] >= val_end]
+
+    print("\nChronological split:")
+    print(f"  Train: {train_df['timestamp'].min()} → {train_df['timestamp'].max()} ({len(train_df):,})")
+    print(f"  Val  : {val_df['timestamp'].min()} → {val_df['timestamp'].max()} ({len(val_df):,})")
+    print(f"  Test : {test_df['timestamp'].min()} → {test_df['timestamp'].max()} ({len(test_df):,})")
+
+    return train_df, val_df, test_df
 
 
 def split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
@@ -60,71 +93,69 @@ def split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-def make_splits(
-    X: pd.DataFrame,
-    y: pd.Series,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
-           pd.Series,    pd.Series,    pd.Series]:
-    """
-    Create stratified 70 / 15 / 15 train / val / test splits.
+def compute_iqr_bounds(
+    df: pd.DataFrame,
+    cols: list[str],
+) -> tuple[pd.Series, pd.Series]:
+    """Compute global IQR bounds for numeric columns (train-only)."""
+    q1 = df[cols].quantile(0.25)
+    q3 = df[cols].quantile(0.75)
+    iqr = q3 - q1
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
 
-    Stratification ensures each split has the same class proportions
-    as the original dataset — critical for 5-class classification.
-    """
-    # Step 1: split off 30% (val + test) from 70% (train)
-    X_train, X_temp, y_train, y_temp = train_test_split(
-        X, y,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_SEED,
-        stratify=y,
-    )
 
-    # Step 2: split the 30% equally into val (15%) and test (15%)
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp,
-        test_size=VAL_FRACTION,
-        random_state=RANDOM_SEED,
-        stratify=y_temp,
-    )
+def clip_outliers(
+    df: pd.DataFrame,
+    cols: list[str],
+    bounds: tuple[pd.Series, pd.Series],
+) -> pd.DataFrame:
+    """Clip numeric columns using global IQR bounds (train-derived)."""
+    df = df.copy()
+    low, high = bounds
+    df[cols] = df[cols].clip(lower=low, upper=high, axis=1)
+    return df
 
-    print(f"\nSplit sizes:")
-    print(f"  Train : {len(X_train):>7,}  ({len(X_train)/len(X)*100:.1f}%)")
-    print(f"  Val   : {len(X_val):>7,}  ({len(X_val)/len(X)*100:.1f}%)")
-    print(f"  Test  : {len(X_test):>7,}  ({len(X_test)/len(X)*100:.1f}%)")
 
-    return X_train, X_val, X_test, y_train, y_val, y_test
+def signed_log1p(df: pd.DataFrame) -> pd.DataFrame:
+    """Signed log1p transform for numeric features (handles negatives)."""
+    values = np.sign(df.to_numpy()) * np.log1p(np.abs(df.to_numpy()))
+    return pd.DataFrame(values, columns=df.columns, index=df.index)
 
 
 def scale_features(
     X_train: pd.DataFrame,
     X_val:   pd.DataFrame,
     X_test:  pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, StandardScaler]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, RobustScaler]:
     """
-    Fit StandardScaler on training data only, then transform all splits.
+    Apply signed log1p, then fit RobustScaler on training data only.
 
     ⚠️  NEVER fit on val/test — that would leak future information.
     """
     feature_names = X_train.columns.tolist()
 
-    scaler = StandardScaler()
+    X_train_t = signed_log1p(X_train)
+    X_val_t = signed_log1p(X_val)
+    X_test_t = signed_log1p(X_test)
+
+    scaler = RobustScaler()
     X_train_s = pd.DataFrame(
-        scaler.fit_transform(X_train),
+        scaler.fit_transform(X_train_t),
         columns=feature_names,
         index=X_train.index,
-    )
+    ).astype("float32")
     X_val_s = pd.DataFrame(
-        scaler.transform(X_val),
+        scaler.transform(X_val_t),
         columns=feature_names,
         index=X_val.index,
-    )
+    ).astype("float32")
     X_test_s = pd.DataFrame(
-        scaler.transform(X_test),
+        scaler.transform(X_test_t),
         columns=feature_names,
         index=X_test.index,
-    )
+    ).astype("float32")
 
-    print(f"\nScaling done — mean≈0, std≈1 on training set.")
+    print("\nScaling done — robust scaling on training set.")
     return X_train_s, X_val_s, X_test_s, scaler
 
 
@@ -146,7 +177,7 @@ def save_splits(
         print(f"  Saved {name:>8} → {path.relative_to(ROOT)}")
 
 
-def save_scaler(scaler: StandardScaler) -> None:
+def save_scaler(scaler: RobustScaler) -> None:
     """Persist fitted scaler so inference never needs to refit."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     path = MODEL_DIR / "scaler.pkl"
@@ -161,13 +192,29 @@ if __name__ == "__main__":
     print(" Preprocessing Pipeline")
     print("=" * 55)
 
-    df = load_features()
+    df = load_features().drop_duplicates()
+
+    print("\nCreating chronological 21/4/5 day splits...")
+    train_df, val_df, test_df = split_chronological(df)
+
+    # Train-derived outlier clipping (per workload)
+    numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+    if LABEL_COL in numeric_cols:
+        numeric_cols.remove(LABEL_COL)
+
+    bounds = compute_iqr_bounds(train_df, numeric_cols)
+    train_df = clip_outliers(train_df, numeric_cols, bounds)
+    val_df = clip_outliers(val_df, numeric_cols, bounds)
+    test_df = clip_outliers(test_df, numeric_cols, bounds)
 
     print("\nExtracting features and labels...")
-    X, y = split_features_labels(df)
+    X_train, y_train = split_features_labels(train_df)
+    X_val, y_val = split_features_labels(val_df)
+    X_test, y_test = split_features_labels(test_df)
 
-    print("\nCreating stratified 70/15/15 splits...")
-    X_train, X_val, X_test, y_train, y_val, y_test = make_splits(X, y)
+    X_train = X_train.fillna(0)
+    X_val = X_val.fillna(0)
+    X_test = X_test.fillna(0)
 
     print("\nScaling features (fit on train only)...")
     X_train_s, X_val_s, X_test_s, scaler = scale_features(X_train, X_val, X_test)
