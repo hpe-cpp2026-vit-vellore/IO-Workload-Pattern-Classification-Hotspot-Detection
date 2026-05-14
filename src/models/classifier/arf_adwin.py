@@ -13,12 +13,8 @@ Blueprint (Phase 2.2):
   - Evaluation      : Prequential (interleaved test-then-train)
 
 Performance note:
-  ARF is a pure-Python online learner. Processing 2.16M rows sequentially
-  would take many hours. We use a CHRONOLOGICAL subsample for prequential
-  training (TRAIN_SAMPLE rows), preserving temporal ordering and workload
-  distribution. The full val and test sets are still evaluated to give
-  accurate hold-out metrics. This is standard practice for benchmarking
-  streaming models on large static datasets.
+  With 5-minute polling intervals, the full dataset is ~432K rows — comfortably
+  processable by ARF in under 30 minutes. No subsampling needed.
 
 Produces:
   models/classifier/arf_metrics.json
@@ -64,10 +60,6 @@ ARF_CONFIG = {
     "warning_delta": 0.01,   # ADWIN warning sensitivity (looser)
     "seed":          42,
 }
-
-# Number of CHRONOLOGICAL rows used for prequential training.
-# 150K covers 30 volumes × 5 workloads × 1000 minutes — enough for robust trees.
-TRAIN_SAMPLE = 150_000
 
 # Accuracy snapshot every N instances (for the prequential accuracy curve)
 SNAPSHOT_INTERVAL = 5_000
@@ -196,17 +188,6 @@ def prequential_evaluate(
     return summary, snapshots
 
 
-def chronological_sample(
-    X: pd.DataFrame, y: pd.Series, n: int
-) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Take the first `n` rows (chronological order is preserved by data_loader).
-    Using the first n rows — not random — is critical to avoid data leakage
-    and to correctly simulate a streaming scenario.
-    """
-    return X.iloc[:n].copy(), y.iloc[:n].copy()
-
-
 def main() -> None:
     print("=" * 70)
     print(" ARF + ADWIN Streaming Classifier  (river 0.24.2)")
@@ -219,19 +200,11 @@ def main() -> None:
     X_val,   y_val   = load_split("val")
     X_test,  y_test  = load_split("test")
 
+    print(f"  train: {len(X_train):,}  val: {len(X_val):,}  test: {len(X_test):,}")
+
     y_train = y_train.astype(int)
     y_val   = y_val.astype(int)
     y_test  = y_test.astype(int)
-
-    print(f"  Full sizes — train: {len(X_train):,}  val: {len(X_val):,}  "
-          f"test: {len(X_test):,}")
-
-    # ── Chronological subsample for prequential training ──────────────────────
-    X_train_s, y_train_s = chronological_sample(X_train, y_train, TRAIN_SAMPLE)
-    print(f"\n  Using first {TRAIN_SAMPLE:,} rows (chronological) for "
-          f"prequential training.\n"
-          f"  Class distribution in sample:\n"
-          f"{y_train_s.value_counts().sort_index().to_string()}")
 
     # ── Build model ───────────────────────────────────────────────────────────
     print(f"\nBuilding ARF (n_models={ARF_CONFIG['n_models']}, "
@@ -239,9 +212,9 @@ def main() -> None:
           f"ADWIN delta={ARF_CONFIG['delta']})...")
     model = build_model()
 
-    # ── Prequential on TRAIN sample (warm-up + primary learning) ─────────────
+    # ── Prequential on TRAIN (full training set) ──────────────────────────────
     train_summary, train_snapshots = prequential_evaluate(
-        X_train_s, y_train_s, model, "train_sample", learn=True
+        X_train, y_train, model, "train", learn=True
     )
 
     # ── Prequential on VAL (model continues online learning) ──────────────────
@@ -256,9 +229,9 @@ def main() -> None:
 
     # ── Save metrics JSON ─────────────────────────────────────────────────────
     all_metrics = {
-        "train_sample": train_summary,
-        "val":          val_summary,
-        "test":         test_summary,
+        "train": train_summary,
+        "val":   val_summary,
+        "test":  test_summary,
     }
     metrics_path = MODEL_DIR / "arf_metrics.json"
     with metrics_path.open("w", encoding="utf-8") as f:
@@ -268,9 +241,9 @@ def main() -> None:
     # ── Save prequential accuracy curve CSV ───────────────────────────────────
     all_snapshots = []
     for split_name, snaps in [
-        ("train_sample", train_snapshots),
-        ("val",          val_snapshots),
-        ("test",         test_snapshots),
+        ("train", train_snapshots),
+        ("val",   val_snapshots),
+        ("test",  test_snapshots),
     ]:
         for s in snaps:
             all_snapshots.append({"split": split_name, **s})
@@ -284,15 +257,15 @@ def main() -> None:
     print(" RESULTS SUMMARY")
     print("=" * 70)
     for label, summary in [
-        ("Train (sample)", train_summary),
-        ("Val   (full)",   val_summary),
-        ("Test  (full)",   test_summary),
+        ("Train (full)",  train_summary),
+        ("Val   (full)",  val_summary),
+        ("Test  (full)",  test_summary),
     ]:
         acc    = summary["final_accuracy"]
         target = "✅" if acc >= 0.95 else "❌ below ≥95% HPE target"
         print(f"  {label:<18} prequential accuracy: {acc:.4f}  {target}")
     print()
-    print("  Per-class F1 (Test — full 360K rows):")
+    print("  Per-class F1 (Test):") 
     for cls, m in test_summary["per_class"].items():
         f1   = m["f1"]
         flag = "✅" if f1 >= 0.95 else "⚠️ "

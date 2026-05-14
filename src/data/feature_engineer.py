@@ -158,35 +158,33 @@ def add_io_size_entropy(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_rolling_window_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add rolling window features (1min, 5min, 15min, 1hr).
+    Add rolling window features.
+    With 5-minute intervals: 3 rows = 15min, 6 rows = 30min, 12 rows = 1hr.
     Rolling mean and std for key metrics over windows.
-    
-    Note: This is computationally expensive for 2M+ rows.
-    We'll compute for key metrics only.
     """
     print("  Computing rolling window features (this may take a while)...")
     
-    # Define windows (in minutes)
-    windows = [5, 15, 60]  # 5min, 15min, 1hr
+    # Define windows (in rows; each row = 5 minutes)
+    windows = {3: "15m", 6: "30m", 12: "1h"}  # rows → label
     
     # Metrics to compute rolling features for
     metrics = ["total_iops", "avg_latency_us", "total_throughput_mbps"]
     
-    for window in windows:
+    for window_rows, label in windows.items():
         for metric in metrics:
             # Rolling mean
-            df[f"{metric}_roll_{window}m_mean"] = (
+            df[f"{metric}_roll_{label}_mean"] = (
                 df.groupby("volume_id", sort=False, observed=True)[metric]
-                .rolling(window=window, min_periods=1)
+                .rolling(window=window_rows, min_periods=1)
                 .mean()
                 .reset_index(level=0, drop=True)
                 .round(2)
             )
             
             # Rolling std
-            df[f"{metric}_roll_{window}m_std"] = (
+            df[f"{metric}_roll_{label}_std"] = (
                 df.groupby("volume_id", sort=False, observed=True)[metric]
-                .rolling(window=window, min_periods=1)
+                .rolling(window=window_rows, min_periods=1)
                 .std()
                 .reset_index(level=0, drop=True)
                 .fillna(0)
@@ -198,22 +196,23 @@ def add_rolling_window_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add lag features (previous values at lags 1, 5, 15, 60 minutes).
+    Add lag features.
+    With 5-minute intervals: 1 row = 5min, 3 rows = 15min, 12 rows = 60min.
     Blueprint requirement: lag features for time-series patterns.
     """
     print("  Computing lag features...")
     
-    # Lag periods (in minutes)
-    lags = [1, 5, 15, 60]
+    # Lag periods (in rows; each row = 5 minutes)
+    lags = {1: "5m", 3: "15m", 6: "30m", 12: "60m"}
     
     # Metrics to lag
     metrics = ["total_iops", "avg_latency_us", "capacity_used_pct"]
     
-    for lag in lags:
+    for lag_rows, label in lags.items():
         for metric in metrics:
-            df[f"{metric}_lag_{lag}m"] = (
+            df[f"{metric}_lag_{label}"] = (
                 df.groupby("volume_id", sort=False, observed=True)[metric]
-                .shift(lag)
+                .shift(lag_rows)
                 .fillna(0)
                 .round(2)
             )
@@ -314,7 +313,8 @@ def validate_features(df: pd.DataFrame) -> None:
     labels_found = sorted(df["label"].unique())
     print(f"Labels found: {labels_found}  ({'✅' if labels_found == [0,1,2,3,4] else '❌'})")
 
-    print(f"Total rows  : {len(df):,}  ({'✅' if len(df) == 2_160_000 else '❌'})")
+    expected_rows = 50 * 30 * 24 * (60 // 5)  # 432,000 with 5-min intervals
+    print(f"Total rows  : {len(df):,}  ({'✅' if len(df) == expected_rows else '❌'})")
     print("────────────────────────────────────────────────\n")
 
 

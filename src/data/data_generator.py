@@ -1,10 +1,10 @@
 """
 src/data/data_generator.py
-Generates 2.16M rows of realistic synthetic IO workload data
+Generates 432K rows of realistic synthetic IO workload data
 for 5 workload types: DB_OLTP, VM, Backup, AI_Training, AI_Inference
 
 Blueprint Requirements (Page 7, Section 1.1):
-- 50 volumes across 5 nodes over 30 days at 1-minute intervals
+- 50 volumes across 5 nodes over 30 days at 5-minute intervals
 - Includes: volume_id, node_id, pool_id, tier, timestamp
 - Separate read_iops/write_iops, latency percentiles (p50/p95/p99)
 - Capacity metrics: capacity_used_gb, capacity_total_gb, capacity_used_pct
@@ -23,10 +23,10 @@ SEED = 42
 NUM_VOLUMES = 50          # 50 volumes total
 NUM_NODES = 5             # 5 storage nodes
 NUM_DAYS = 30             # 30 days of data
-INTERVAL_MINUTES = 1      # 1-minute intervals
+INTERVAL_MINUTES = 5      # 5-minute intervals (industry standard for enterprise storage)
 
-# Total rows = 50 volumes × 30 days × 24 hours × 60 minutes = 2,160,000 rows
-TOTAL_ROWS = NUM_VOLUMES * NUM_DAYS * 24 * 60
+# Total rows = 50 volumes × 30 days × 24 hours × (60/5) intervals = 432,000 rows
+TOTAL_ROWS = NUM_VOLUMES * NUM_DAYS * 24 * (60 // INTERVAL_MINUTES)
 
 # Storage tiers
 TIERS = ["NVMe", "SSD", "HDD"]
@@ -455,7 +455,7 @@ def inject_noisy_neighbor_events(
 ) -> pd.DataFrame:
     """
     Inject noisy neighbor events: one volume spikes IOPS and neighbors see latency spikes.
-    Assumes df is sorted by timestamp then volume_id with fixed 1-minute intervals.
+    Assumes df is sorted by timestamp then volume_id with fixed 5-minute intervals.
     """
     rng = np.random.default_rng(seed)
     num_timestamps = NUM_DAYS * 24 * (60 // INTERVAL_MINUTES)
@@ -548,7 +548,7 @@ def generate_time_series_data() -> pd.DataFrame:
     
     Structure:
     - 50 volumes across 5 nodes
-    - 30 days of data at 1-minute intervals
+    - 30 days of data at 5-minute intervals
     - Each volume assigned a workload type
     - Realistic time-of-day patterns
     - Capacity growth over time
@@ -641,7 +641,7 @@ def generate_time_series_data() -> pd.DataFrame:
         volumes,
         volume_to_node,
         n_events=500,
-        duration_minutes=15,
+        duration_minutes=3,  # 3 intervals × 5 min = 15 real minutes
     )
     
     # Downcast numeric columns to reduce memory usage
@@ -660,7 +660,7 @@ def generate_time_series_data() -> pd.DataFrame:
 if __name__ == "__main__":
     print("=" * 70)
     print(" IO Workload Time-Series Data Generator")
-    print(" Blueprint-Compliant: 50 volumes, 5 nodes, 30 days, 1-min intervals")
+    print(" Blueprint-Compliant: 50 volumes, 5 nodes, 30 days, 5-min intervals")
     print("=" * 70)
 
     df = generate_time_series_data()
