@@ -1,0 +1,149 @@
+{
+  "train": {
+    "accuracy": 0.9909722222222223,
+    "classification_report": {
+      "0": {
+        "precision": 0.9869273902142557,
+        "recall": 0.9851849647725507,
+        "f1-score": 0.9860554077486134,
+        "support": 302463.0
+      },
+      "1": {
+        "precision": 0.9883836973856901,
+        "recall": 0.9877180999291305,
+        "f1-score": 0.9880507865629892,
+        "support": 311841.0
+      },
+      "2": {
+        "precision": 0.9965805419157172,
+        "recall": 0.9968532377447292,
+        "f1-score": 0.9967168711782328,
+        "support": 292364.0
+      },
+      "3": {
+        "precision": 0.9951043159844748,
+        "recall": 0.9962938790732366,
+        "f1-score": 0.995698742235689,
+        "support": 300314.0
+      },
+      "4": {
+        "precision": 0.9881731805334023,
+        "recall": 0.98916129539896,
+        "f1-score": 0.9886669910754807,
+        "support": 305018.0
+      },
+      "accuracy": 0.9909722222222223,
+      "macro avg": {
+        "precision": 0.9910338252067079,
+        "recall": 0.9910422953837215,
+        "f1-score": 0.9910377597602011,
+        "support": 1512000.0
+      },
+      "weighted avg": {
+        "precision": 0.9909697209589757,
+        "recall": 0.9909722222222223,
+        "f1-score": 0.9909706705100796,
+        "support": 1512000.0
+      }
+    },
+    "confusion_matrix_path": "models\\classifier\\lightgbm_confusion_matrix_train.csv"
+  },
+  "val": {
+    "accuracy": 0.9396145833333334,
+    "classification_report": {
+      "0": {
+        "precision": 0.8819629099338652,
+        "recall": 0.9070240328150473,
+        "f1-score": 0.8943179363090351,
+        "support": 57047.0
+      },
+      "1": {
+        "precision": 0.9094952042746672,
+        "recall": 0.9206322543799237,
+        "f1-score": 0.9150298426478568,
+        "support": 59533.0
+      },
+      "2": {
+        "precision": 0.9816289357272964,
+        "recall": 0.983368958865544,
+        "f1-score": 0.9824981768934264,
+        "support": 57543.0
+      },
+      "3": {
+        "precision": 0.9778136761243534,
+        "recall": 0.9709887709478139,
+        "f1-score": 0.9743892727786483,
+        "support": 58598.0
+      },
+      "4": {
+        "precision": 0.9499962431437373,
+        "recall": 0.9148863040214186,
+        "f1-score": 0.9321107680965766,
+        "support": 55279.0
+      },
+      "accuracy": 0.9396145833333334,
+      "macro avg": {
+        "precision": 0.940179393840784,
+        "recall": 0.9393800642059494,
+        "f1-score": 0.9396691993451085,
+        "support": 288000.0
+      },
+      "weighted avg": {
+        "precision": 0.9401283266872025,
+        "recall": 0.9396145833333334,
+        "f1-score": 0.939763657235586,
+        "support": 288000.0
+      }
+    },
+    "confusion_matrix_path": "models\\classifier\\lightgbm_confusion_matrix_val.csv"
+  },
+  "test": {
+    "accuracy": 0.9301888888888888,
+    "classification_report": {
+      "0": {
+        "precision": 0.8494707431089141,
+        "recall": 0.9178762192289828,
+        "f1-score": 0.8823496581554346,
+        "support": 68896.0
+      },
+      "1": {
+        "precision": 0.9099786857612526,
+        "recall": 0.8839465742858302,
+        "f1-score": 0.896773750686436,
+        "support": 73897.0
+      },
+      "2": {
+        "precision": 0.9738588128631674,
+        "recall": 0.9821562162311934,
+        "f1-score": 0.9779899157809062,
+        "support": 72182.0
+      },
+      "3": {
+        "precision": 0.9742520117817833,
+        "recall": 0.9534514861044066,
+        "f1-score": 0.9637395268433453,
+        "support": 72505.0
+      },
+      "4": {
+        "precision": 0.9466716177037661,
+        "recall": 0.9140237175951461,
+        "f1-score": 0.9300612463957233,
+        "support": 72520.0
+      },
+      "accuracy": 0.9301888888888888,
+      "macro avg": {
+        "precision": 0.9308463742437768,
+        "recall": 0.9302908426891119,
+        "f1-score": 0.9301828195723691,
+        "support": 360000.0
+      },
+      "weighted avg": {
+        "precision": 0.9315435442198209,
+        "recall": 0.9301888888888888,
+        "f1-score": 0.930490266627901,
+        "support": 360000.0
+      }
+    },
+    "confusion_matrix_path": "models\\classifier\\lightgbm_confusion_matrix_test.csv"
+  }
+}
