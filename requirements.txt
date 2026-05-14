@@ -8,6 +8,7 @@ scipy>=1.10.0
 scikit-learn>=1.4.0
 lightgbm>=4.3.0
 shap>=0.40.0
+river==0.24.2
 
 # MLOps & Experiment Tracking
 mlflow>=2.10.0
