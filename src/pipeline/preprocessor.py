@@ -31,14 +31,33 @@ MODEL_DIR  = ROOT / "models"
 TRAIN_DAYS  = 21
 VAL_DAYS    = 4
 
-# Columns to drop before training (non-numeric / identifiers / redundant)
+# Columns to drop before training (non-numeric / identifiers / leaky features)
 DROP_COLS = [
-    "workload_type",  # Text label (we use 'label' instead)
-    "volume_id",      # Identifier (not a feature)
-    "node_id",        # Identifier (can be used for topology analysis later)
-    "pool_id",        # Identifier (can be used for topology analysis later)
-    "tier",           # Categorical (can be encoded if needed, but not for baseline)
-    "timestamp",      # Time identifier (we use derived time features instead)
+    # ── Identifiers (not features) ──
+    "workload_type",          # Text label (we use 'label' instead)
+    "volume_id",              # Volume identifier
+    "node_id",                # Node identifier
+    "pool_id",                # Pool identifier
+    "tier",                   # Storage tier (categorical)
+    "timestamp",              # Time identifier
+    
+    # ── LEAKY: Capacity features (volume-specific, not workload-specific) ──
+    "capacity_total_gb",      # Fixed per volume → memorization
+    "capacity_headroom_gb",   # Derived from total → memorization
+    "capacity_used_gb",       # Volume-specific usage → memorization
+    "capacity_used_pct",      # Volume-specific percentage → memorization
+    "capacity_burn_rate",     # Derived from capacity_used_gb → memorization
+    
+    # ── LEAKY: Capacity lag/delta features (derived from capacity_used_pct) ──
+    "capacity_used_pct_lag_5m",
+    "capacity_used_pct_lag_15m",
+    "capacity_used_pct_lag_30m",
+    "capacity_used_pct_lag_60m",
+    "capacity_used_pct_delta",
+    "capacity_used_pct_pct_change",
+    
+    # ── LEAKY: Time features that reveal train/val/test split ──
+    "day_of_month",           # Chronological split → reveals which split
 ]
 LABEL_COL = "label"
 
