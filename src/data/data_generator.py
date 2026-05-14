@@ -13,6 +13,7 @@ Blueprint Requirements (Page 7, Section 1.1):
 import numpy as np
 import pandas as pd
 import os
+import shutil
 from datetime import datetime
 
 # Reproducibility seed (set inside function to ensure reproducibility)
@@ -37,144 +38,197 @@ POOLS_PER_NODE = 2
 WORKLOAD_TYPES = ["DB_OLTP", "VM", "Backup", "AI_Training", "AI_Inference"]
 
 
-def generate_db_oltp(n: int) -> pd.DataFrame:
+def build_workload_schedule(
+    volumes: list[str],
+    num_timestamps: int,
+    seed: int = SEED + 3,
+) -> tuple[np.ndarray, dict[str, str]]:
     """
-    Database OLTP — high IOPS, low latency, small random reads/writes
-    Blueprint: 5K-15K OPS, 4-16KB, 70/30 R/W (70% reads, 30% writes), Random, 9AM-6PM peak
+    Build a per-volume workload schedule with a dominant workload and time windows
+    that switch to other workloads.
     """
-    total_iops = np.random.normal(10000, 2000, n).clip(5000, 15000)
-    read_ratio = np.random.normal(0.70, 0.08, n).clip(0.3, 0.95)
-    
-    return pd.DataFrame({
-        "workload_type"       : ["DB_OLTP"] * n,
-        "read_iops"           : (total_iops * read_ratio).round(0).astype(int),
-        "write_iops"          : (total_iops * (1 - read_ratio)).round(0).astype(int),
-        "total_iops"          : total_iops.round(0).astype(int),
-        "read_throughput_mbps": np.random.normal(120, 20, n).clip(30, 250),
-        "write_throughput_mbps": np.random.normal(60, 15, n).clip(10, 150),
-        "read_latency_p50_us" : np.random.normal(400, 80, n).clip(100, 1000),
-        "read_latency_p95_us" : np.random.normal(800, 150, n).clip(300, 2000),
-        "read_latency_p99_us" : np.random.normal(1200, 200, n).clip(500, 3000),
-        "write_latency_p50_us": np.random.normal(500, 100, n).clip(150, 1200),
-        "write_latency_p95_us": np.random.normal(1000, 180, n).clip(400, 2500),
-        "write_latency_p99_us": np.random.normal(1500, 250, n).clip(600, 3500),
-        "io_size_avg_kb"      : np.random.choice([4, 8, 16], n, p=[0.6, 0.3, 0.1]),
-        "queue_depth"         : np.random.randint(8, 32, n),
-        "sequential_ratio"    : np.random.normal(0.15, 0.05, n).clip(0.05, 0.35),  # Mostly random
-        "read_write_ratio"    : read_ratio.round(4),
-    })
+    rng = np.random.default_rng(seed)
+
+    base_count = len(volumes) // len(WORKLOAD_TYPES)
+    remainder = len(volumes) % len(WORKLOAD_TYPES)
+
+    workload_list: list[str] = []
+    for i, wl in enumerate(WORKLOAD_TYPES):
+        count = base_count + (1 if i < remainder else 0)
+        workload_list.extend([wl] * count)
+
+    rng.shuffle(workload_list)
+    dominant_map = dict(zip(volumes, workload_list))
+
+    mixed_count = max(1, int(len(volumes) * 0.2))
+    mixed_vols = set(rng.choice(volumes, size=mixed_count, replace=False))
+
+    workload_rows = np.empty(num_timestamps * len(volumes), dtype=object)
+    time_index = np.arange(num_timestamps)
+
+    for i, vol in enumerate(volumes):
+        dominant = dominant_map[vol]
+        schedule = np.full(num_timestamps, dominant, dtype=object)
+
+        switch_ratio = rng.uniform(0.4, 0.6) if vol in mixed_vols else rng.uniform(0.1, 0.3)
+        target = int(num_timestamps * switch_ratio)
+        used = 0
+
+        while used < target:
+            window_len = int(rng.integers(30, 240))
+            start = int(rng.integers(0, num_timestamps - window_len))
+            alt = rng.choice([w for w in WORKLOAD_TYPES if w != dominant])
+            schedule[start:start + window_len] = alt
+            used += window_len
+
+        idx = i + time_index * len(volumes)
+        workload_rows[idx] = schedule
+
+    return workload_rows, dominant_map
 
 
-def generate_vm(n: int) -> pd.DataFrame:
+def generate_metrics_from_latent(
+    df: pd.DataFrame,
+    volumes: list[str],
+    seed: int = SEED + 5,
+) -> pd.DataFrame:
     """
-    Virtual Machines — mixed read/write, bursty patterns
-    Blueprint: 1K-5K OPS, 8-64KB, 60/40 R/W, Mixed, Business hours
+    Generate IO metrics from shared latent factors.
+    Workload type only nudges the latent factors; it does not fully determine them.
     """
-    total_iops = np.random.normal(3000, 1000, n).clip(1000, 5000)
-    read_ratio = np.random.normal(0.60, 0.12, n).clip(0.3, 0.85)
-    
-    return pd.DataFrame({
-        "workload_type"       : ["VM"] * n,
-        "read_iops"           : (total_iops * read_ratio).round(0).astype(int),
-        "write_iops"          : (total_iops * (1 - read_ratio)).round(0).astype(int),
-        "total_iops"          : total_iops.round(0).astype(int),
-        "read_throughput_mbps": np.random.normal(80, 25, n).clip(15, 200),
-        "write_throughput_mbps": np.random.normal(50, 20, n).clip(10, 150),
-        "read_latency_p50_us" : np.random.normal(1200, 300, n).clip(300, 3000),
-        "read_latency_p95_us" : np.random.normal(2500, 500, n).clip(800, 5000),
-        "read_latency_p99_us" : np.random.normal(3500, 700, n).clip(1200, 7000),
-        "write_latency_p50_us": np.random.normal(1500, 350, n).clip(400, 3500),
-        "write_latency_p95_us": np.random.normal(3000, 600, n).clip(1000, 6000),
-        "write_latency_p99_us": np.random.normal(4200, 800, n).clip(1500, 8000),
-        "io_size_avg_kb"      : np.random.choice([8, 16, 64], n, p=[0.3, 0.5, 0.2]),
-        "queue_depth"         : np.random.randint(4, 24, n),
-        "sequential_ratio"    : np.random.normal(0.40, 0.10, n).clip(0.2, 0.7),  # Mixed
-        "read_write_ratio"    : read_ratio.round(4),
-    })
+    rng = np.random.default_rng(seed)
+    n = len(df)
 
+    volume_index = pd.Index(volumes)
+    vol_idx = volume_index.get_indexer(df["volume_id"])
 
-def generate_backup(n: int) -> pd.DataFrame:
-    """
-    Backup/Archive — large sequential writes, low IOPS, high throughput
-    Blueprint: 100-500 OPS, 256KB-1MB, 5/95 R/W, Sequential, 1AM-4AM burst
-    """
-    total_iops = np.random.normal(300, 100, n).clip(100, 500)
-    read_ratio = np.random.normal(0.05, 0.03, n).clip(0.01, 0.15)
-    
-    return pd.DataFrame({
-        "workload_type"       : ["Backup"] * n,
-        "read_iops"           : (total_iops * read_ratio).round(0).astype(int),
-        "write_iops"          : (total_iops * (1 - read_ratio)).round(0).astype(int),
-        "total_iops"          : total_iops.round(0).astype(int),
-        "read_throughput_mbps": np.random.normal(50, 20, n).clip(5, 150),
-        "write_throughput_mbps": np.random.normal(850, 150, n).clip(400, 1400),
-        "read_latency_p50_us" : np.random.normal(5000, 1000, n).clip(1000, 12000),
-        "read_latency_p95_us" : np.random.normal(10000, 2000, n).clip(3000, 20000),
-        "read_latency_p99_us" : np.random.normal(15000, 3000, n).clip(5000, 30000),
-        "write_latency_p50_us": np.random.normal(6000, 1200, n).clip(1500, 15000),
-        "write_latency_p95_us": np.random.normal(12000, 2500, n).clip(4000, 25000),
-        "write_latency_p99_us": np.random.normal(18000, 3500, n).clip(6000, 35000),
-        "io_size_avg_kb"      : np.random.choice([256, 512, 1024], n, p=[0.3, 0.5, 0.2]),
-        "queue_depth"         : np.random.randint(1, 8, n),
-        "sequential_ratio"    : np.random.normal(0.92, 0.04, n).clip(0.8, 0.99),  # Highly sequential
-        "read_write_ratio"    : read_ratio.round(4),
-    })
+    nudge_intensity = {
+        "DB_OLTP": 0.6,
+        "VM": 0.3,
+        "Backup": -0.2,
+        "AI_Training": 0.5,
+        "AI_Inference": 0.7,
+    }
+    nudge_burstiness = {
+        "DB_OLTP": 0.4,
+        "VM": 0.3,
+        "Backup": 0.7,
+        "AI_Training": 0.2,
+        "AI_Inference": 0.8,
+    }
+    nudge_sequentiality = {
+        "DB_OLTP": -0.4,
+        "VM": -0.1,
+        "Backup": 0.8,
+        "AI_Training": 0.7,
+        "AI_Inference": -0.2,
+    }
+    nudge_read_bias = {
+        "DB_OLTP": 0.2,
+        "VM": 0.1,
+        "Backup": -0.5,
+        "AI_Training": 0.4,
+        "AI_Inference": 0.6,
+    }
+    nudge_pressure = {
+        "DB_OLTP": 0.2,
+        "VM": 0.1,
+        "Backup": 0.4,
+        "AI_Training": 0.3,
+        "AI_Inference": 0.4,
+    }
 
+    base_intensity = df["workload_type"].map(nudge_intensity).to_numpy()
+    base_burstiness = df["workload_type"].map(nudge_burstiness).to_numpy()
+    base_sequentiality = df["workload_type"].map(nudge_sequentiality).to_numpy()
+    base_read_bias = df["workload_type"].map(nudge_read_bias).to_numpy()
+    base_pressure = df["workload_type"].map(nudge_pressure).to_numpy()
 
-def generate_ai_training(n: int) -> pd.DataFrame:
-    """
-    AI Training — massive sequential reads, very high bandwidth
-    Blueprint: 2K-8K OPS, 64-256KB, 70/30 R/W (70% reads, 30% writes), Sequential, Long sustained
-    """
-    total_iops = np.random.normal(5000, 1500, n).clip(2000, 8000)
-    read_ratio = np.random.normal(0.70, 0.08, n).clip(0.5, 0.95)
-    
-    return pd.DataFrame({
-        "workload_type"       : ["AI_Training"] * n,
-        "read_iops"           : (total_iops * read_ratio).round(0).astype(int),
-        "write_iops"          : (total_iops * (1 - read_ratio)).round(0).astype(int),
-        "total_iops"          : total_iops.round(0).astype(int),
-        "read_throughput_mbps": np.random.normal(1800, 300, n).clip(600, 3000),
-        "write_throughput_mbps": np.random.normal(700, 150, n).clip(200, 1200),
-        "read_latency_p50_us" : np.random.normal(2500, 500, n).clip(500, 6000),
-        "read_latency_p95_us" : np.random.normal(5000, 1000, n).clip(1500, 10000),
-        "read_latency_p99_us" : np.random.normal(7500, 1500, n).clip(2500, 15000),
-        "write_latency_p50_us": np.random.normal(3000, 600, n).clip(800, 7000),
-        "write_latency_p95_us": np.random.normal(6000, 1200, n).clip(2000, 12000),
-        "write_latency_p99_us": np.random.normal(9000, 1800, n).clip(3000, 18000),
-        "io_size_avg_kb"      : np.random.choice([64, 128, 256], n, p=[0.3, 0.4, 0.3]),
-        "queue_depth"         : np.random.randint(16, 64, n),
-        "sequential_ratio"    : np.random.normal(0.88, 0.05, n).clip(0.7, 0.98),  # Highly sequential
-        "read_write_ratio"    : read_ratio.round(4),
-    })
+    vol_offsets = rng.normal(0, 0.25, size=(len(volumes), 5))
 
+    intensity = base_intensity + vol_offsets[vol_idx, 0] + rng.normal(0, 0.35, n)
+    burstiness = base_burstiness + vol_offsets[vol_idx, 1] + rng.normal(0, 0.35, n)
+    sequentiality = base_sequentiality + vol_offsets[vol_idx, 2] + rng.normal(0, 0.25, n)
+    read_bias = base_read_bias + vol_offsets[vol_idx, 3] + rng.normal(0, 0.25, n)
+    capacity_pressure = base_pressure + vol_offsets[vol_idx, 4] + rng.normal(0, 0.25, n)
 
-def generate_ai_inference(n: int) -> pd.DataFrame:
-    """
-    AI Inference — spiky low-latency reads, unpredictable bursts
-    Blueprint: 8K-25K OPS, 8-32KB, 90/10 R/W, Random, Spiky latency-critical
-    """
-    total_iops = np.random.normal(16000, 5000, n).clip(8000, 25000)
-    read_ratio = np.random.normal(0.90, 0.05, n).clip(0.75, 0.98)
-    
-    return pd.DataFrame({
-        "workload_type"       : ["AI_Inference"] * n,
-        "read_iops"           : (total_iops * read_ratio).round(0).astype(int),
-        "write_iops"          : (total_iops * (1 - read_ratio)).round(0).astype(int),
-        "total_iops"          : total_iops.round(0).astype(int),
-        "read_throughput_mbps": np.random.normal(280, 80, n).clip(80, 600),
-        "write_throughput_mbps": np.random.normal(35, 15, n).clip(5, 100),
-        "read_latency_p50_us" : np.random.normal(600, 150, n).clip(100, 1500),
-        "read_latency_p95_us" : np.random.normal(1200, 300, n).clip(300, 2500),
-        "read_latency_p99_us" : np.random.normal(1800, 450, n).clip(500, 3500),
-        "write_latency_p50_us": np.random.normal(800, 200, n).clip(150, 2000),
-        "write_latency_p95_us": np.random.normal(1600, 400, n).clip(400, 3500),
-        "write_latency_p99_us": np.random.normal(2400, 600, n).clip(600, 5000),
-        "io_size_avg_kb"      : np.random.choice([8, 16, 32], n, p=[0.4, 0.4, 0.2]),
-        "queue_depth"         : np.random.randint(2, 16, n),
-        "sequential_ratio"    : np.random.normal(0.20, 0.08, n).clip(0.05, 0.45),  # Mostly random
-        "read_write_ratio"    : read_ratio.round(4),
-    })
+    intensity = np.clip(intensity, -1.5, 1.5)
+    burstiness = np.clip(burstiness, -1.5, 1.5)
+    sequentiality = np.clip(sequentiality, -1.5, 1.5)
+    read_bias = np.clip(read_bias, -1.5, 1.5)
+    capacity_pressure = np.clip(capacity_pressure, -1.5, 1.5)
+
+    total_iops = (
+        500
+        + (intensity + 1.2) * 6000
+        + (burstiness + 1.0) * 800
+        + rng.normal(0, 900, n)
+    )
+    total_iops = np.clip(total_iops, 100, 25000)
+
+    read_ratio = 1 / (1 + np.exp(-read_bias * 2))
+    read_ratio = np.clip(read_ratio, 0.05, 0.95)
+
+    read_iops = (total_iops * read_ratio).round(0).astype(int)
+    write_iops = (total_iops * (1 - read_ratio)).round(0).astype(int)
+
+    sequential_ratio = 1 / (1 + np.exp(-sequentiality * 1.5))
+    sequential_ratio = np.clip(sequential_ratio, 0.05, 0.99)
+
+    queue_depth = (
+        2 + (intensity + 1.2) * 8 + (burstiness + 1.0) * 3 + rng.normal(0, 2, n)
+    )
+    queue_depth = np.clip(queue_depth, 1, 64).round(0).astype(int)
+
+    seq_bins = np.array([0.1, 0.22, 0.35, 0.5, 0.65, 0.78, 0.88, 0.95])
+    size_buckets = np.array([4, 8, 16, 32, 64, 128, 256, 512, 1024])
+    bucket_idx = np.digitize(sequential_ratio, seq_bins)
+    io_size_avg_kb = size_buckets[bucket_idx]
+
+    total_throughput_mbps = (total_iops * io_size_avg_kb) / 1024.0
+    eff = np.clip(rng.normal(1.0, 0.15, n) + 0.1 * intensity, 0.5, 1.6)
+    total_throughput_mbps = (total_throughput_mbps * eff).round(2)
+
+    read_throughput_mbps = (total_throughput_mbps * read_ratio).round(2)
+    write_throughput_mbps = (total_throughput_mbps * (1 - read_ratio)).round(2)
+
+    latency_base = (
+        300
+        + 800 * (capacity_pressure + 1.0)
+        + 400 * (1 - sequential_ratio)
+        + 200 * (burstiness + 1.0)
+        + rng.normal(0, 150, n)
+    )
+    latency_base = np.clip(latency_base, 100, 20000)
+
+    read_latency_p50 = (latency_base * rng.normal(1.0, 0.06, n)).clip(80, 30000)
+    write_latency_p50 = (latency_base * rng.normal(1.1, 0.08, n)).clip(100, 35000)
+
+    p95_mult = 1.6 + 0.5 * np.abs(burstiness)
+    p99_mult = 2.2 + 0.7 * np.abs(burstiness)
+
+    read_latency_p95 = (read_latency_p50 * p95_mult).clip(150, 50000)
+    read_latency_p99 = (read_latency_p50 * p99_mult).clip(200, 70000)
+    write_latency_p95 = (write_latency_p50 * p95_mult).clip(200, 60000)
+    write_latency_p99 = (write_latency_p50 * p99_mult).clip(250, 80000)
+
+    df["read_iops"] = read_iops
+    df["write_iops"] = write_iops
+    df["total_iops"] = read_iops + write_iops
+    df["read_throughput_mbps"] = read_throughput_mbps
+    df["write_throughput_mbps"] = write_throughput_mbps
+    df["read_latency_p50_us"] = read_latency_p50.round(2)
+    df["read_latency_p95_us"] = read_latency_p95.round(2)
+    df["read_latency_p99_us"] = read_latency_p99.round(2)
+    df["write_latency_p50_us"] = write_latency_p50.round(2)
+    df["write_latency_p95_us"] = write_latency_p95.round(2)
+    df["write_latency_p99_us"] = write_latency_p99.round(2)
+    df["io_size_avg_kb"] = io_size_avg_kb
+    df["queue_depth"] = queue_depth
+    df["sequential_ratio"] = sequential_ratio.round(4)
+    df["read_write_ratio"] = read_ratio.round(4)
+
+    return df
 
 
 def assign_topology_and_capacity(df: pd.DataFrame, volumes: list, volume_to_node: dict, 
@@ -217,22 +271,42 @@ def assign_topology_and_capacity(df: pd.DataFrame, volumes: list, volume_to_node
     initial_usage_pct = np.random.uniform(0.30, 0.60, NUM_VOLUMES)
     volume_initial_usage = dict(zip(volumes, initial_usage_pct))
     
-    # Growth rate: 0.5-3% per day (varies by workload)
-    # Using dampened exponential growth to avoid clipping at 98%
-    growth_rate_map = {
-        "DB_OLTP": 0.012,      # 1.2% per day
-        "VM": 0.008,           # 0.8% per day
-        "Backup": 0.018,       # 1.8% per day (fastest growth)
-        "AI_Training": 0.015,  # 1.5% per day
-        "AI_Inference": 0.006, # 0.6% per day (slowest)
+    # Growth rate: mostly volume/tier-driven with weak workload influence
+    rng = np.random.default_rng(SEED + 21)
+    tier_base_growth = {
+        "NVMe": 0.010,
+        "SSD": 0.008,
+        "HDD": 0.006,
     }
-    
-    df["growth_rate"] = df["workload_type"].map(growth_rate_map)
+    workload_nudge = {
+        "DB_OLTP": 0.0005,
+        "VM": 0.0002,
+        "Backup": 0.0015,
+        "AI_Training": 0.0010,
+        "AI_Inference": 0.0004,
+    }
+
+    volume_growth = {}
+    volume_wave_amp = {}
+    volume_wave_phase = {}
+    for vol in volumes:
+        tier = volume_to_tier[vol]
+        base = tier_base_growth[tier] + rng.normal(0.0, 0.002)
+        volume_growth[vol] = float(np.clip(base, 0.002, 0.020))
+        volume_wave_amp[vol] = float(rng.uniform(0.0, 0.002))
+        volume_wave_phase[vol] = float(rng.uniform(0, 2 * np.pi))
+
+    df["growth_rate"] = df["volume_id"].map(volume_growth)
+    df["growth_rate"] = df["growth_rate"] + df["workload_type"].map(workload_nudge)
+    df["growth_wave"] = (
+        df["volume_id"].map(volume_wave_amp)
+        * np.sin((2 * np.pi * df["days_elapsed"] / 7) + df["volume_id"].map(volume_wave_phase))
+    )
     df["initial_usage_pct"] = df["volume_id"].map(volume_initial_usage)
     
     # Calculate current usage percentage with dampened growth (logistic curve)
     # Growth rate shapes the curve per workload type
-    k = df["growth_rate"]
+    k = (df["growth_rate"] + df["growth_wave"]).clip(0.001, 0.03)
     max_capacity = 0.95
     df["capacity_used_pct"] = (
         df["initial_usage_pct"] + 
@@ -244,63 +318,214 @@ def assign_topology_and_capacity(df: pd.DataFrame, volumes: list, volume_to_node
     df["capacity_used_gb"] = (df["capacity_total_gb"] * df["capacity_used_pct"]).round(2)
     
     # Drop temporary columns
-    df = df.drop(columns=["days_elapsed", "growth_rate", "initial_usage_pct"])
+    df = df.drop(columns=["days_elapsed", "growth_rate", "growth_wave", "initial_usage_pct"])
     
     return df
 
 
-def add_time_patterns(df: pd.DataFrame) -> pd.DataFrame:
+def add_time_patterns(
+    df: pd.DataFrame,
+    volume_dominant: dict[str, str],
+    seed: int = SEED + 11,
+) -> pd.DataFrame:
     """
-    Add realistic time-of-day patterns to IO metrics (VECTORIZED for performance).
-    - DB_OLTP: peaks 9AM-6PM
-    - Backup: bursts 1AM-4AM
-    - VM: business hours
-    - AI_Training: sustained 24/7
-    - AI_Inference: spiky throughout day
+    Add probabilistic time-of-day patterns with day-to-day shifts.
+    Time is a weak signal, not a hard label.
     """
-    # No df.copy() needed - we return a modified DataFrame and caller doesn't keep old reference
-    df["hour"] = df["timestamp"].dt.hour
-    
-    # Initialize time_multiplier with default value
-    df["time_multiplier"] = 1.0
-    
-    # Vectorized time-of-day multipliers per workload type
-    # DB_OLTP: Peak 9AM-6PM (hours 9-18)
-    mask_db_peak = (df["workload_type"] == "DB_OLTP") & (df["hour"] >= 9) & (df["hour"] <= 18)
-    mask_db_off = (df["workload_type"] == "DB_OLTP") & ((df["hour"] < 9) | (df["hour"] > 18))
-    df.loc[mask_db_peak, "time_multiplier"] = np.random.uniform(1.3, 1.6, mask_db_peak.sum())
-    df.loc[mask_db_off, "time_multiplier"] = np.random.uniform(0.4, 0.7, mask_db_off.sum())
-    
-    # Backup: Burst 1AM-4AM (hours 1-4)
-    mask_backup_burst = (df["workload_type"] == "Backup") & (df["hour"] >= 1) & (df["hour"] <= 4)
-    mask_backup_off = (df["workload_type"] == "Backup") & ((df["hour"] < 1) | (df["hour"] > 4))
-    df.loc[mask_backup_burst, "time_multiplier"] = np.random.uniform(2.0, 3.0, mask_backup_burst.sum())
-    df.loc[mask_backup_off, "time_multiplier"] = np.random.uniform(0.1, 0.3, mask_backup_off.sum())
-    
-    # VM: Business hours 8AM-7PM
-    mask_vm_peak = (df["workload_type"] == "VM") & (df["hour"] >= 8) & (df["hour"] <= 19)
-    mask_vm_off = (df["workload_type"] == "VM") & ((df["hour"] < 8) | (df["hour"] > 19))
-    df.loc[mask_vm_peak, "time_multiplier"] = np.random.uniform(1.2, 1.5, mask_vm_peak.sum())
-    df.loc[mask_vm_off, "time_multiplier"] = np.random.uniform(0.5, 0.8, mask_vm_off.sum())
-    
-    # AI_Training: Sustained 24/7 with minor variance
-    mask_ai_train = df["workload_type"] == "AI_Training"
-    df.loc[mask_ai_train, "time_multiplier"] = np.random.uniform(0.9, 1.1, mask_ai_train.sum())
-    
-    # AI_Inference: Spiky throughout day
-    mask_ai_infer = df["workload_type"] == "AI_Inference"
-    df.loc[mask_ai_infer, "time_multiplier"] = np.random.uniform(0.7, 1.8, mask_ai_infer.sum())
-    
-    # Apply multiplier to IOPS and throughput
-    df["read_iops"] = (df["read_iops"] * df["time_multiplier"]).round(0).astype(int)
-    df["write_iops"] = (df["write_iops"] * df["time_multiplier"]).round(0).astype(int)
+    rng = np.random.default_rng(seed)
+
+    hour = df["timestamp"].dt.hour.to_numpy()
+    day_of_year = df["timestamp"].dt.dayofyear.to_numpy()
+
+    phase_mean = {
+        "DB_OLTP": 13.0,
+        "VM": 12.0,
+        "Backup": 2.0,
+        "AI_Training": 15.0,
+        "AI_Inference": 14.0,
+    }
+    amp_mean = {
+        "DB_OLTP": 0.45,
+        "VM": 0.35,
+        "Backup": 0.55,
+        "AI_Training": 0.15,
+        "AI_Inference": 0.25,
+    }
+
+    volume_phase = {}
+    volume_amp = {}
+    for vol, dom in volume_dominant.items():
+        phase = rng.normal(phase_mean[dom], 3.0) % 24
+        amp = np.clip(rng.normal(amp_mean[dom], 0.12), 0.05, 0.8)
+        volume_phase[vol] = phase
+        volume_amp[vol] = amp
+
+    phase = df["volume_id"].map(volume_phase).to_numpy()
+    amp = df["volume_id"].map(volume_amp).to_numpy()
+
+    day_shift = 0.6 * np.sin(2 * np.pi * (day_of_year / 7))
+    noise = rng.normal(0, 0.05, len(df))
+
+    time_multiplier = 1 + amp * np.sin(2 * np.pi * (hour - phase + day_shift) / 24) + noise
+    anomaly_mask = rng.random(len(df)) < 0.02
+    time_multiplier[anomaly_mask] *= rng.uniform(1.2, 1.6, anomaly_mask.sum())
+    time_multiplier = np.clip(time_multiplier, 0.6, 1.6)
+
+    df["read_iops"] = (df["read_iops"] * time_multiplier).round(0).astype(int)
+    df["write_iops"] = (df["write_iops"] * time_multiplier).round(0).astype(int)
     df["total_iops"] = df["read_iops"] + df["write_iops"]
-    df["read_throughput_mbps"] = (df["read_throughput_mbps"] * df["time_multiplier"]).round(2)
-    df["write_throughput_mbps"] = (df["write_throughput_mbps"] * df["time_multiplier"]).round(2)
+    df["read_throughput_mbps"] = (df["read_throughput_mbps"] * time_multiplier).round(2)
+    df["write_throughput_mbps"] = (df["write_throughput_mbps"] * time_multiplier).round(2)
+
+    latency_scale = 1 + (time_multiplier - 1) * 0.15
+    latency_cols = [
+        "read_latency_p50_us",
+        "read_latency_p95_us",
+        "read_latency_p99_us",
+        "write_latency_p50_us",
+        "write_latency_p95_us",
+        "write_latency_p99_us",
+    ]
+    for col in latency_cols:
+        df[col] = (df[col] * latency_scale).round(2)
     
-    # Drop temporary columns
-    df = df.drop(columns=["time_multiplier", "hour"])
-    
+    return df
+
+
+def apply_concept_bleed(
+    df: pd.DataFrame,
+    volumes: list[str],
+    bleed_ratio: float = 0.03,
+    seed: int = SEED + 7,
+) -> pd.DataFrame:
+    """Swap a small fraction of feature rows across workloads to blur boundaries."""
+    n_bleed = int(len(df) * bleed_ratio)
+    if n_bleed <= 0:
+        return df
+
+    rng = np.random.default_rng(seed)
+    workloads = df["workload_type"].to_numpy()
+    indices_by_workload = {w: np.where(workloads == w)[0] for w in WORKLOAD_TYPES}
+
+    target_idx = rng.choice(len(df), size=n_bleed, replace=False)
+    target_workloads = workloads[target_idx]
+    donor_idx = np.empty(n_bleed, dtype=int)
+
+    for w in WORKLOAD_TYPES:
+        mask = target_workloads == w
+        if not mask.any():
+            continue
+        other_indices = np.concatenate(
+            [indices_by_workload[ow] for ow in WORKLOAD_TYPES if ow != w]
+        )
+        donor_idx[mask] = rng.choice(other_indices, size=mask.sum(), replace=True)
+
+    bleed_cols = [
+        "read_iops",
+        "write_iops",
+        "read_throughput_mbps",
+        "write_throughput_mbps",
+        "read_latency_p50_us",
+        "read_latency_p95_us",
+        "read_latency_p99_us",
+        "write_latency_p50_us",
+        "write_latency_p95_us",
+        "write_latency_p99_us",
+        "io_size_avg_kb",
+        "queue_depth",
+        "sequential_ratio",
+        "read_write_ratio",
+    ]
+
+    df.loc[target_idx, bleed_cols] = df.loc[donor_idx, bleed_cols].to_numpy()
+    df.loc[target_idx, "total_iops"] = (
+        df.loc[target_idx, "read_iops"] + df.loc[target_idx, "write_iops"]
+    )
+
+    return df
+
+
+def inject_noisy_neighbor_events(
+    df: pd.DataFrame,
+    volumes: list[str],
+    volume_to_node: dict[str, str],
+    n_events: int = 500,
+    duration_minutes: int = 15,
+    seed: int = SEED + 13,
+) -> pd.DataFrame:
+    """
+    Inject noisy neighbor events: one volume spikes IOPS and neighbors see latency spikes.
+    Assumes df is sorted by timestamp then volume_id with fixed 1-minute intervals.
+    """
+    rng = np.random.default_rng(seed)
+    num_timestamps = NUM_DAYS * 24 * (60 // INTERVAL_MINUTES)
+    if num_timestamps <= duration_minutes:
+        return df
+
+    volume_pos = {vol: i for i, vol in enumerate(volumes)}
+    node_to_vols: dict[str, list[str]] = {}
+    for vol in volumes:
+        node_to_vols.setdefault(volume_to_node[vol], []).append(vol)
+
+    start_indices = rng.integers(0, num_timestamps - duration_minutes, size=n_events)
+    noisy_vols = rng.choice(volumes, size=n_events, replace=True)
+
+    latency_cols = [
+        "read_latency_p50_us",
+        "read_latency_p95_us",
+        "read_latency_p99_us",
+        "write_latency_p50_us",
+        "write_latency_p95_us",
+        "write_latency_p99_us",
+    ]
+
+    for start_idx, noisy_vol in zip(start_indices, noisy_vols):
+        node_id = volume_to_node[noisy_vol]
+        neighbor_vols = [v for v in node_to_vols[node_id] if v != noisy_vol]
+        if not neighbor_vols:
+            continue
+
+        t_range = np.arange(start_idx, start_idx + duration_minutes)
+        base_rows = t_range * NUM_VOLUMES
+
+        noisy_pos = volume_pos[noisy_vol]
+        noisy_rows = base_rows + noisy_pos
+
+        neighbor_pos = np.array([volume_pos[v] for v in neighbor_vols], dtype=int)
+        neighbor_rows = (base_rows[:, None] + neighbor_pos[None, :]).reshape(-1)
+
+        iops_mult = rng.uniform(1.4, 1.9)
+        thr_mult = rng.uniform(1.2, 1.6)
+        df.loc[noisy_rows, "read_iops"] = (
+            df.loc[noisy_rows, "read_iops"] * iops_mult
+        ).round(0).astype(int)
+        df.loc[noisy_rows, "write_iops"] = (
+            df.loc[noisy_rows, "write_iops"] * iops_mult
+        ).round(0).astype(int)
+        df.loc[noisy_rows, "total_iops"] = (
+            df.loc[noisy_rows, "read_iops"] + df.loc[noisy_rows, "write_iops"]
+        )
+        df.loc[noisy_rows, "read_throughput_mbps"] = (
+            df.loc[noisy_rows, "read_throughput_mbps"] * thr_mult
+        ).round(2)
+        df.loc[noisy_rows, "write_throughput_mbps"] = (
+            df.loc[noisy_rows, "write_throughput_mbps"] * thr_mult
+        ).round(2)
+
+        latency_mult = rng.uniform(1.4, 2.2)
+        for col in latency_cols:
+            df.loc[neighbor_rows, col] = (
+                df.loc[neighbor_rows, col] * latency_mult
+            ).round(2)
+
+        thr_down = rng.uniform(0.7, 0.9)
+        df.loc[neighbor_rows, "read_throughput_mbps"] = (
+            df.loc[neighbor_rows, "read_throughput_mbps"] * thr_down
+        ).round(2)
+        df.loc[neighbor_rows, "write_throughput_mbps"] = (
+            df.loc[neighbor_rows, "write_throughput_mbps"] * thr_down
+        ).round(2)
+
     return df
 
 
@@ -367,20 +592,6 @@ def generate_time_series_data() -> pd.DataFrame:
     np.random.shuffle(tier_list)
     volume_to_tier = dict(zip(volumes, tier_list))
     
-    # Assign workload types to volumes (balanced distribution)
-    # Distribute remainder round-robin instead of always to first workload
-    workload_per_volume = {}
-    base_count = NUM_VOLUMES // len(WORKLOAD_TYPES)
-    remainder = NUM_VOLUMES % len(WORKLOAD_TYPES)
-    
-    workload_list = []
-    for i, wl in enumerate(WORKLOAD_TYPES):
-        count = base_count + (1 if i < remainder else 0)  # Round-robin remainder
-        workload_list.extend([wl] * count)
-    
-    np.random.shuffle(workload_list)
-    workload_per_volume = dict(zip(volumes, workload_list))
-    
     # Generate timestamps (30 days, using INTERVAL_MINUTES)
     start_time = datetime(2026, 4, 1, 0, 0, 0)  # Start: April 1, 2026
     num_timestamps = NUM_DAYS * 24 * (60 // INTERVAL_MINUTES)
@@ -402,47 +613,36 @@ def generate_time_series_data() -> pd.DataFrame:
     })
     print(f"  Base rows created: {len(df_base):,}")
     
-    # Assign workload type to each volume
-    df_base["workload_type"] = df_base["volume_id"].map(workload_per_volume)
-    
-    # Generate workload-specific metrics for each row
-    print("\nGenerating workload-specific IO metrics...")
-    workload_dfs = []
-    for workload in WORKLOAD_TYPES:
-        mask = df_base["workload_type"] == workload
-        n = mask.sum()
-        print(f"  {workload}: {n:,} rows")
-        
-        if workload == "DB_OLTP":
-            metrics = generate_db_oltp(n)
-        elif workload == "VM":
-            metrics = generate_vm(n)
-        elif workload == "Backup":
-            metrics = generate_backup(n)
-        elif workload == "AI_Training":
-            metrics = generate_ai_training(n)
-        elif workload == "AI_Inference":
-            metrics = generate_ai_inference(n)
-        
-        # Drop workload_type from metrics (already in df_base)
-        metrics = metrics.drop(columns=["workload_type"])
-        
-        # Combine with base data
-        df_workload = df_base[mask].reset_index(drop=True)
-        df_workload = pd.concat([df_workload, metrics], axis=1)
-        workload_dfs.append(df_workload)
+    # Assign time-varying workload schedule per volume
+    print("\nAssigning time-varying workload schedules...")
+    workload_rows, dominant_map = build_workload_schedule(volumes, num_timestamps)
+    df_base["workload_type"] = workload_rows
 
-    # Combine all workloads and sort chronologically
-    df = pd.concat(workload_dfs, ignore_index=True)
-    df = df.sort_values(["timestamp", "volume_id"]).reset_index(drop=True)
+    # Generate metrics from shared latent factors
+    print("Generating IO metrics from latent factors...")
+    df = generate_metrics_from_latent(df_base, volumes)
     
     # Add topology and capacity
     print("\nAdding topology and capacity metrics...")
     df = assign_topology_and_capacity(df, volumes, volume_to_node, volume_to_pool, volume_to_tier)
     
-    # Add time-of-day patterns
+    # Add probabilistic time-of-day patterns
     print("Applying time-of-day patterns...")
-    df = add_time_patterns(df)
+    df = add_time_patterns(df, dominant_map)
+
+    # Apply light concept bleed before injecting anomalies
+    print("Applying concept bleed...")
+    df = apply_concept_bleed(df, volumes, bleed_ratio=0.03)
+
+    # Inject noisy neighbor events for hotspot/anomaly detection
+    print("Injecting noisy neighbor events...")
+    df = inject_noisy_neighbor_events(
+        df,
+        volumes,
+        volume_to_node,
+        n_events=500,
+        duration_minutes=15,
+    )
     
     # Downcast numeric columns to reduce memory usage
     df = downcast_numeric(df)
@@ -475,9 +675,13 @@ if __name__ == "__main__":
     # Save as Parquet with partitioning for efficient querying
     parquet_path = "data/synthetic/io_workload_data.parquet"
     print(f"\nSaving Parquet (partitioned by workload_type) → {parquet_path}")
-    if os.path.exists(parquet_path) and os.path.isfile(parquet_path):
-        print(f"  ! Existing file at {parquet_path} will be removed to create a partitioned directory")
-        os.remove(parquet_path)
+    if os.path.exists(parquet_path):
+        if os.path.isdir(parquet_path):
+            print(f"  ! Existing partitioned directory at {parquet_path} will be removed")
+            shutil.rmtree(parquet_path)
+        elif os.path.isfile(parquet_path):
+            print(f"  ! Existing file at {parquet_path} will be removed to create a partitioned directory")
+            os.remove(parquet_path)
     df.to_parquet(parquet_path, partition_cols=["workload_type"], index=False, engine="pyarrow")
     print(f"  ✅ Saved (partitioned into 5 workload subdirectories)")
 
