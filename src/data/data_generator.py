@@ -103,37 +103,37 @@ def generate_metrics_from_latent(
     vol_idx = volume_index.get_indexer(df["volume_id"])
 
     nudge_intensity = {
-        "DB_OLTP": 0.6,
-        "VM": 0.3,
-        "Backup": -0.2,
+        "DB_OLTP": 0.75,
+        "VM": 0.15,
+        "Backup": -0.3,
+        "AI_Training": 0.55,
+        "AI_Inference": 0.85,
+    }
+    nudge_burstiness = {
+        "DB_OLTP": 0.5,
+        "VM": 0.2,
+        "Backup": 0.75,
+        "AI_Training": 0.15,
+        "AI_Inference": 0.85,
+    }
+    nudge_sequentiality = {
+        "DB_OLTP": -0.55,
+        "VM": 0.05,
+        "Backup": 0.85,
+        "AI_Training": 0.75,
+        "AI_Inference": -0.35,
+    }
+    nudge_read_bias = {
+        "DB_OLTP": 0.35,
+        "VM": -0.05,
+        "Backup": -0.6,
         "AI_Training": 0.5,
         "AI_Inference": 0.7,
     }
-    nudge_burstiness = {
-        "DB_OLTP": 0.4,
-        "VM": 0.3,
-        "Backup": 0.7,
-        "AI_Training": 0.2,
-        "AI_Inference": 0.8,
-    }
-    nudge_sequentiality = {
-        "DB_OLTP": -0.4,
-        "VM": -0.1,
-        "Backup": 0.8,
-        "AI_Training": 0.7,
-        "AI_Inference": -0.2,
-    }
-    nudge_read_bias = {
-        "DB_OLTP": 0.2,
-        "VM": 0.1,
-        "Backup": -0.5,
-        "AI_Training": 0.4,
-        "AI_Inference": 0.6,
-    }
     nudge_pressure = {
-        "DB_OLTP": 0.2,
-        "VM": 0.1,
-        "Backup": 0.4,
+        "DB_OLTP": 0.25,
+        "VM": 0.05,
+        "Backup": 0.45,
         "AI_Training": 0.3,
         "AI_Inference": 0.4,
     }
@@ -144,13 +144,13 @@ def generate_metrics_from_latent(
     base_read_bias = df["workload_type"].map(nudge_read_bias).to_numpy()
     base_pressure = df["workload_type"].map(nudge_pressure).to_numpy()
 
-    vol_offsets = rng.normal(0, 0.25, size=(len(volumes), 5))
+    vol_offsets = rng.normal(0, 0.18, size=(len(volumes), 5))
 
-    intensity = base_intensity + vol_offsets[vol_idx, 0] + rng.normal(0, 0.35, n)
-    burstiness = base_burstiness + vol_offsets[vol_idx, 1] + rng.normal(0, 0.35, n)
-    sequentiality = base_sequentiality + vol_offsets[vol_idx, 2] + rng.normal(0, 0.25, n)
-    read_bias = base_read_bias + vol_offsets[vol_idx, 3] + rng.normal(0, 0.25, n)
-    capacity_pressure = base_pressure + vol_offsets[vol_idx, 4] + rng.normal(0, 0.25, n)
+    intensity = base_intensity + vol_offsets[vol_idx, 0] + rng.normal(0, 0.25, n)
+    burstiness = base_burstiness + vol_offsets[vol_idx, 1] + rng.normal(0, 0.25, n)
+    sequentiality = base_sequentiality + vol_offsets[vol_idx, 2] + rng.normal(0, 0.20, n)
+    read_bias = base_read_bias + vol_offsets[vol_idx, 3] + rng.normal(0, 0.20, n)
+    capacity_pressure = base_pressure + vol_offsets[vol_idx, 4] + rng.normal(0, 0.20, n)
 
     intensity = np.clip(intensity, -1.5, 1.5)
     burstiness = np.clip(burstiness, -1.5, 1.5)
