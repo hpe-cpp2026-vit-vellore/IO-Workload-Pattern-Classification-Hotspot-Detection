@@ -220,3 +220,6 @@ models/classifier/*.csv
 models/anomaly/statistical_detector_alerts.json
 models/anomaly/statistical_detector_scores.csv
 models/anomaly/statistical_detector_stats.json
+models/anomaly/isolation_forest_anomalies.json
+models/anomaly/isolation_forest_scores.csv
+models/anomaly/isolation_forest_stats.json
