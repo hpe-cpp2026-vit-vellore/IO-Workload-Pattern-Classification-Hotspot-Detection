@@ -223,3 +223,7 @@ models/anomaly/statistical_detector_stats.json
 models/anomaly/isolation_forest_anomalies.json
 models/anomaly/isolation_forest_scores.csv
 models/anomaly/isolation_forest_stats.json
+models/anomaly/lstm_ae_stats.json
+models/anomaly/lstm_ae_model.pth
+models/anomaly/lstm_ae_anomalies.json
+models/anomaly/lstm_ae_scores.csv
