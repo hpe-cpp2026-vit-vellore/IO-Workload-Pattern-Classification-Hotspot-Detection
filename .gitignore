@@ -230,3 +230,6 @@ models/anomaly/lstm_ae_scores.csv
 models/anomaly/ensemble_anomalies.json
 models/anomaly/ensemble_scores.csv
 models/anomaly/ensemble_stats.json
+models/anomaly/noisy_neighbor/noisy_neighbor_events.json
+models/anomaly/noisy_neighbor/noisy_neighbor_report.csv
+models/anomaly/noisy_neighbor/noisy_neighbor_stats.json
