@@ -1,0 +1,11 @@
+{
+  "w_stat": 0.35,
+  "w_if": 0.35,
+  "w_lstm": 0.3,
+  "alarm_threshold": 40.0,
+  "min_agreement": 1,
+  "lstm_error_cap": 1.2204135656356812,
+  "lstm_error_percentile_cap": 99.0,
+  "use_meta": false,
+  "total_detections": 11883
+}

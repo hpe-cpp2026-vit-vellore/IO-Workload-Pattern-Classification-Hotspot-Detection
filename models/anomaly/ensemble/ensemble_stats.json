@@ -1,0 +1,90 @@
+{
+  "ensemble": {
+    "total_detections": 11883,
+    "detections_per_volume": {
+      "vol_036": 2266,
+      "vol_040": 1616,
+      "vol_044": 1194,
+      "vol_042": 1188,
+      "vol_037": 899,
+      "vol_047": 737,
+      "vol_049": 641,
+      "vol_046": 624,
+      "vol_045": 567,
+      "vol_039": 537,
+      "vol_041": 515,
+      "vol_038": 346,
+      "vol_048": 317,
+      "vol_043": 247,
+      "vol_035": 189
+    },
+    "weights": {
+      "statistical": 0.35,
+      "isolation_forest": 0.35,
+      "lstm": 0.3
+    },
+    "alarm_threshold": 40.0,
+    "min_agreement": 1,
+    "meta_learner_active": false,
+    "score_distribution": {
+      "count": 0,
+      "mean": null,
+      "std": null,
+      "p50": null,
+      "p95": null,
+      "p99": null
+    }
+  },
+  "statistical_detector": {
+    "total_detections": 854,
+    "volumes_monitored": 15,
+    "volumes_with_baselines": 15,
+    "detections_per_volume": {
+      "vol_035": 68,
+      "vol_036": 65,
+      "vol_037": 66,
+      "vol_038": 42,
+      "vol_039": 60,
+      "vol_040": 65,
+      "vol_041": 67,
+      "vol_042": 41,
+      "vol_043": 51,
+      "vol_044": 61,
+      "vol_045": 57,
+      "vol_046": 49,
+      "vol_047": 43,
+      "vol_048": 56,
+      "vol_049": 63
+    }
+  },
+  "isolation_forest": {
+    "is_fitted": true,
+    "n_features": 10,
+    "feature_names": null,
+    "total_samples_processed": 129600,
+    "anomalies_detected": 9245,
+    "anomaly_rate": 0.0713,
+    "contamination_threshold": 0.05,
+    "n_estimators": 200,
+    "max_samples": 256,
+    "score_norm_anchors": {
+      "low (most-normal pct)": -0.38802379926060565,
+      "high (least-normal pct)": -0.5646860987278868
+    }
+  },
+  "lstm_autoencoder": {
+    "is_fitted": true,
+    "input_dim": 10,
+    "sequence_length": 12,
+    "threshold": 0.8584738969802856,
+    "threshold_percentile": 95.0,
+    "total_samples_processed": 159631,
+    "anomalies_detected": 9444,
+    "anomaly_rate": 0.0592,
+    "device": "cuda",
+    "amp_enabled": true,
+    "compiled": true,
+    "final_train_loss": 0.37074735846498347,
+    "final_val_loss": 0.47448164224624634
+  }
+}

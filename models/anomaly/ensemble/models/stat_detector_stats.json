@@ -1,0 +1,22 @@
+{
+  "total_detections": 854,
+  "volumes_monitored": 15,
+  "volumes_with_baselines": 15,
+  "detections_per_volume": {
+    "vol_035": 68,
+    "vol_036": 65,
+    "vol_037": 66,
+    "vol_038": 42,
+    "vol_039": 60,
+    "vol_040": 65,
+    "vol_041": 67,
+    "vol_042": 41,
+    "vol_043": 51,
+    "vol_044": 61,
+    "vol_045": 57,
+    "vol_046": 49,
+    "vol_047": 43,
+    "vol_048": 56,
+    "vol_049": 63
+  }
+}
