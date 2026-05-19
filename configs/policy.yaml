@@ -1,0 +1,22 @@
+rebalance_policy:
+  enabled: true
+  dry_run_mode: false
+  min_hotspot_score_to_trigger: 75
+  min_hotspot_duration_minutes: 2
+  max_volumes_moved_per_hour: 3
+  max_concurrent_migrations: 1
+
+safety_guardrails:
+  rollback_if_target_latency_increases_pct: 20
+  rollback_timeout_minutes: 5
+  max_rollback_rate_pct: 1.0
+
+capacity_policy:
+  warning_threshold_pct: 85
+  critical_threshold_pct: 95
+  dtf_warning_days: 30
+  dtf_critical_days: 7
+
+qos_policy:
+  backup_iops_cap: 3000
+  max_noisy_neighbor_impact_pct: 15

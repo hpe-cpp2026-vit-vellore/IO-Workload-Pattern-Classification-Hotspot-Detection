@@ -697,7 +697,15 @@ class LSTMAutoencoder:
             device=device,
         )
 
-        detector.model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
+        # Strip "_orig_mod." prefix if present (e.g. from torch.compile)
+        fixed_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("_orig_mod."):
+                fixed_state_dict[k[len("_orig_mod."):]] = v
+            else:
+                fixed_state_dict[k] = v
+        detector.model.load_state_dict(fixed_state_dict)
         detector.scaler = checkpoint["scaler"]
         detector.threshold = checkpoint["threshold"]
         detector.train_losses = checkpoint["train_losses"]
