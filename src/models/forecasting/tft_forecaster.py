@@ -41,10 +41,10 @@ FORECAST_SIZE = 6         # Forecast horizon: 6 hours ahead
 D_MODEL = 32
 N_HEADS = 2
 DROPOUT = 0.1
-N_EPOCHS = 10
+N_EPOCHS = 50
 BATCH_SIZE = 256
 LR = 5e-4
-PATIENCE = 3
+PATIENCE = 8
 QUANTILES = [0.5, 0.9, 0.95] # Median, 90th percentile, 95th percentile (Tail Risk)
 
 # Latency risk threshold (e.g., 10,000 microseconds / 10ms is flagged as high-risk tail event)
@@ -103,7 +103,7 @@ def prepare_hourly_latency(
         "write_throughput_mbps": "mean",
         "queue_depth": "mean",
         "sequential_ratio": "mean",
-        "latency_p95_us": "max" # We track peak tail latency risk
+        "latency_p95_us": "mean" # We track mean tail latency risk to prevent systematic max-aggregation overestimation
     }
 
     # Step 1: Resample all volumes and collect in a dict of unscaled dataframes
