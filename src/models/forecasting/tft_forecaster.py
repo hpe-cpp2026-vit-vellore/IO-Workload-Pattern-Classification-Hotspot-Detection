@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -74,14 +75,18 @@ def load_features(root: Path) -> pd.DataFrame:
         
     raise FileNotFoundError(f"No features file at {pq} or {csv}")
 
-def prepare_hourly_latency(features: pd.DataFrame) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+def prepare_hourly_latency(
+    features: pd.DataFrame
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], StandardScaler, StandardScaler]:
     """
     Resample high-frequency metrics to hourly resolution for all volumes,
     retaining peak p95 tail latencies and averaging physical performance metrics.
     
     Returns:
-        - volume_features: {volume_id: np.ndarray of shape [720, num_features]}
-        - volume_targets: {volume_id: np.ndarray of shape [720]} representing tail latency target
+        - volume_features: {volume_id: np.ndarray of shape [720, num_features]} (SCALED)
+        - volume_targets: {volume_id: np.ndarray of shape [720]} (SCALED)
+        - feature_scaler: fitted StandardScaler for features
+        - target_scaler: fitted StandardScaler for targets
     """
     # Create worst-case tail latency column
     df = features.copy()
@@ -89,9 +94,6 @@ def prepare_hourly_latency(features: pd.DataFrame) -> Tuple[Dict[str, np.ndarray
     
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     df["hour_ts"] = pd.to_datetime(df["timestamp"].dt.round("h"))
-
-    volume_features: Dict[str, np.ndarray] = {}
-    volume_targets: Dict[str, np.ndarray] = {}
 
     # Define aggregations: mean for throughput/iops/queue, max for tail latency
     agg_rules = {
@@ -104,27 +106,41 @@ def prepare_hourly_latency(features: pd.DataFrame) -> Tuple[Dict[str, np.ndarray
         "latency_p95_us": "max" # We track peak tail latency risk
     }
 
+    # Step 1: Resample all volumes and collect in a dict of unscaled dataframes
+    unscaled_resampled: Dict[str, pd.DataFrame] = {}
     for vol_id, grp in df.groupby("volume_id", observed=False):
         grp = grp.set_index("hour_ts").sort_index()
-        
-        # Resample to hourly steps to establish a uniform timeline
         grp_resampled = grp.resample("h").agg(agg_rules)
-        
-        # Gap-filling (Forward-fill and fallback backward-fill)
         grp_resampled = grp_resampled.ffill().bfill()
-        
-        # Scale protection: ensure tail latencies are positive
         grp_resampled["latency_p95_us"] = grp_resampled["latency_p95_us"].clip(lower=0.0)
+        unscaled_resampled[str(vol_id)] = grp_resampled
 
-        # Standard normalization: scale each feature to prevent gradient explosion
-        # Note: we retain absolute metrics for forecasting targets later
-        features_matrix = grp_resampled[FEATURE_COLS].values.astype(np.float32)
-        target_series = grp_resampled["latency_p95_us"].values.astype(np.float32)
+    # Step 2: Fit global scalers on concatenated resampled data
+    all_resampled_df = pd.concat(unscaled_resampled.values(), axis=0)
+    
+    feature_scaler = StandardScaler()
+    feature_scaler.fit(all_resampled_df[FEATURE_COLS].values.astype(np.float32))
+    
+    target_scaler = StandardScaler()
+    target_scaler.fit(all_resampled_df[["latency_p95_us"]].values.astype(np.float32))
 
-        volume_features[str(vol_id)] = features_matrix
-        volume_targets[str(vol_id)] = target_series
+    volume_features: Dict[str, np.ndarray] = {}
+    volume_targets: Dict[str, np.ndarray] = {}
 
-    return volume_features, volume_targets
+    # Step 3: Scale each volume's series and populate dictionaries
+    for vol_id, grp_resampled in unscaled_resampled.items():
+        features_matrix_raw = grp_resampled[FEATURE_COLS].values.astype(np.float32)
+        target_series_raw = grp_resampled["latency_p95_us"].values.astype(np.float32)
+        
+        # Scale features
+        features_matrix_scaled = feature_scaler.transform(features_matrix_raw)
+        # Scale target (make sure to reshape for scaler and squeeze back to 1D)
+        target_series_scaled = target_scaler.transform(target_series_raw.reshape(-1, 1)).squeeze(1)
+
+        volume_features[vol_id] = features_matrix_scaled.astype(np.float32)
+        volume_targets[vol_id] = target_series_scaled.astype(np.float32)
+
+    return volume_features, volume_targets, feature_scaler, target_scaler
 
 def split_tft_series(
     volume_features: Dict[str, np.ndarray],
@@ -294,7 +310,7 @@ def main() -> int:
     features = load_features(PROJECT_ROOT)
     logger.info("Features loaded: %d rows", len(features))
 
-    volume_features, volume_targets = prepare_hourly_latency(features)
+    volume_features, volume_targets, feature_scaler, target_scaler = prepare_hourly_latency(features)
     n_volumes = len(volume_features)
     logger.info("Hourly series prepared: %d volumes, %d hours each",
                 n_volumes, next(iter(volume_features.values())).shape[0])
@@ -358,6 +374,9 @@ def main() -> int:
     results = []
     high_risk_count = 0
 
+    target_mean = float(target_scaler.mean_[0])
+    target_scale = float(target_scaler.scale_[0])
+
     with torch.no_grad():
         for vol_id in volume_features.keys():
             feats = volume_features[vol_id]
@@ -368,13 +387,13 @@ def main() -> int:
             
             pred = model(x).cpu().numpy().squeeze(0) # [forecast_size, num_quantiles]
 
-            # Unpack quantile forecasts
-            p50_forecast = pred[:, 0]
-            p90_forecast = pred[:, 1]
-            p95_forecast = pred[:, 2]
+            # Unpack and unscale quantile forecasts
+            p50_forecast = np.clip(pred[:, 0] * target_scale + target_mean, 0.0, None)
+            p90_forecast = np.clip(pred[:, 1] * target_scale + target_mean, 0.0, None)
+            p95_forecast = np.clip(pred[:, 2] * target_scale + target_mean, 0.0, None)
 
             max_p95_forecast = float(np.max(p95_forecast))
-            current_p95 = float(feats[-1, -1]) # last element of target feature column
+            current_p95 = float(feats[-1, -1]) * target_scale + target_mean
 
             # Identify if there is a tail latency risk breach forecasted
             is_risk = max_p95_forecast >= LATENCY_RISK_THRESHOLD_US
