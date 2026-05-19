@@ -195,8 +195,9 @@ class InferenceHub:
         row = self.get_raw_feature_row(volume_id, timestamp)
         
         classifier_feature_cols = self.classifier_scaler.feature_names_in_.tolist()
-        features_vec = row[classifier_feature_cols].values.reshape(1, -1)
-        features_scaled = self.classifier_scaler.transform(features_vec)
+        features_vec = row[classifier_feature_cols].values.astype(np.float64).reshape(1, -1)
+        features_log = np.sign(features_vec) * np.log1p(np.abs(features_vec))
+        features_scaled = self.classifier_scaler.transform(features_log)
         
         # Predict workload
         pred_class = int(self.classifier.predict(features_scaled)[0])

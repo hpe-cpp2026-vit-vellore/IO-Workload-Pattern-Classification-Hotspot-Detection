@@ -11,6 +11,7 @@ import sys
 import shap
 import uvicorn
 import asyncio
+import uuid
 import logging
 import pandas as pd
 import numpy as np
@@ -209,8 +210,9 @@ def get_volume_explanation(id: str):
     row = hub.get_raw_feature_row(id, pd.to_datetime(hub.features_df["timestamp"].max()))
     
     classifier_feature_cols = hub.classifier_scaler.feature_names_in_.tolist()
-    features_vec = row[classifier_feature_cols].values.reshape(1, -1)
-    features_scaled = hub.classifier_scaler.transform(features_vec)
+    features_vec = row[classifier_feature_cols].values.astype(np.float64).reshape(1, -1)
+    features_log = np.sign(features_vec) * np.log1p(np.abs(features_vec))
+    features_scaled = hub.classifier_scaler.transform(features_log)
     
     pred_class = int(hub.classifier.predict(features_scaled)[0])
     shap_vals = explainer.shap_values(features_scaled)
@@ -511,8 +513,6 @@ def trigger_rebalance(req: RebalanceRequest):
     elif req.action_type == "tier_change":
         action_state = rebalancer.execute_tier_change(req.volume_id, req.target, hub.topology)
         
-    action_id = str(uuid.uuid4()) if hasattr(uuid, "uuid4") else "manual-rebalance"
-    import uuid
     action_id = str(uuid.uuid4())
     
     monitor.register_action(

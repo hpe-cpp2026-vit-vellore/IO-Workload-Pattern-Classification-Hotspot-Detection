@@ -169,6 +169,13 @@ def post_api_data(endpoint: str, payload: dict) -> Any:
     except Exception as e:
         return {"detail": str(e)}
 
+def put_api_data(endpoint: str, payload: dict) -> Any:
+    try:
+        response = requests.put(f"{API_URL}{endpoint}", json=payload, timeout=5)
+        return response.json() if response.status_code == 200 else {"detail": response.text}
+    except Exception as e:
+        return {"detail": str(e)}
+
 
 # --- Sidebar Navigation ---
 st.sidebar.markdown(
@@ -681,7 +688,7 @@ elif selected_page == "Rebalancing History & Control":
                         "rollback_if_target_latency_increases_pct": float(rollback_pct)
                     }
                 }
-                res = post_api_data("/policy", payload)
+                res = put_api_data("/policy", payload)
                 if "status" in res and res["status"] == "success":
                     st.success("🟢 Control Plane policy updated successfully.")
                     time.sleep(1.0)

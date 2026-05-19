@@ -47,8 +47,8 @@ class WhatIfSimulator:
             device="cpu"
         )
 
-        before_days = sim_res.get("days_to_fill_orig")
-        after_days = sim_res.get("days_to_fill_sim")
+        before_days = float(sim_res.get("dtf_warning_before_days")) if sim_res.get("dtf_warning_before_days") is not None else None
+        after_days = float(sim_res.get("dtf_warning_after_days")) if sim_res.get("dtf_warning_after_days") is not None else None
         improvement = (after_days - before_days) if (before_days is not None and after_days is not None) else 0.0
 
         recommendation = (
