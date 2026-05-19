@@ -76,8 +76,9 @@ def load_features(root: Path) -> pd.DataFrame:
     raise FileNotFoundError(f"No features file at {pq} or {csv}")
 
 def prepare_hourly_latency(
-    features: pd.DataFrame
-) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], StandardScaler, StandardScaler]:
+    features: pd.DataFrame,
+    val_hours: int = 72
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], StandardScaler]:
     """
     Resample high-frequency metrics to hourly resolution for all volumes,
     retaining peak p95 tail latencies and averaging physical performance metrics.
@@ -85,8 +86,7 @@ def prepare_hourly_latency(
     Returns:
         - volume_features: {volume_id: np.ndarray of shape [720, num_features]} (SCALED)
         - volume_targets: {volume_id: np.ndarray of shape [720]} (SCALED)
-        - feature_scaler: fitted StandardScaler for features
-        - target_scaler: fitted StandardScaler for targets
+        - feature_scaler: fitted StandardScaler for features (fit on train split only)
     """
     # Create worst-case tail latency column
     df = features.copy()
@@ -111,21 +111,31 @@ def prepare_hourly_latency(
     for vol_id, grp in df.groupby("volume_id", observed=False):
         grp = grp.set_index("hour_ts").sort_index()
         grp_resampled = grp.resample("h").agg(agg_rules)
-        grp_resampled = grp_resampled.ffill().bfill()
+        # Use forward-fill and constant fill for leading NaNs to avoid look-ahead bias
+        grp_resampled = grp_resampled.ffill().fillna(0.0)
         grp_resampled["latency_p95_us"] = grp_resampled["latency_p95_us"].clip(lower=0.0)
         unscaled_resampled[str(vol_id)] = grp_resampled
 
-    # Step 2: Fit global scalers on concatenated resampled data
-    all_resampled_df = pd.concat(unscaled_resampled.values(), axis=0)
+    # Step 2: Fit global scaler on training split only to prevent validation leakage
+    train_rows = []
+    for vol_id, grp_resampled in unscaled_resampled.items():
+        series_len = len(grp_resampled)
+        train_cutoff = series_len - val_hours
+        if train_cutoff > 0:
+            train_rows.append(grp_resampled.iloc[:train_cutoff])
+        else:
+            train_rows.append(grp_resampled)
+            
+    all_train_df = pd.concat(train_rows, axis=0)
     
     feature_scaler = StandardScaler()
-    feature_scaler.fit(all_resampled_df[FEATURE_COLS].values.astype(np.float32))
-    
-    target_scaler = StandardScaler()
-    target_scaler.fit(all_resampled_df[["latency_p95_us"]].values.astype(np.float32))
+    feature_scaler.fit(all_train_df[FEATURE_COLS].values.astype(np.float32))
 
     volume_features: Dict[str, np.ndarray] = {}
     volume_targets: Dict[str, np.ndarray] = {}
+
+    target_mean = feature_scaler.mean_[-1]
+    target_scale = feature_scaler.scale_[-1]
 
     # Step 3: Scale each volume's series and populate dictionaries
     for vol_id, grp_resampled in unscaled_resampled.items():
@@ -134,13 +144,13 @@ def prepare_hourly_latency(
         
         # Scale features
         features_matrix_scaled = feature_scaler.transform(features_matrix_raw)
-        # Scale target (make sure to reshape for scaler and squeeze back to 1D)
-        target_series_scaled = target_scaler.transform(target_series_raw.reshape(-1, 1)).squeeze(1)
+        # Scale target using the parameters of latency_p95_us (the target column)
+        target_series_scaled = (target_series_raw - target_mean) / target_scale
 
         volume_features[vol_id] = features_matrix_scaled.astype(np.float32)
         volume_targets[vol_id] = target_series_scaled.astype(np.float32)
 
-    return volume_features, volume_targets, feature_scaler, target_scaler
+    return volume_features, volume_targets, feature_scaler
 
 def split_tft_series(
     volume_features: Dict[str, np.ndarray],
@@ -166,7 +176,8 @@ def split_tft_series(
         max_possible_val = len(feats) - window
         actual_val_hours = min(val_hours, max_possible_val)
 
-        if actual_val_hours >= FORECAST_SIZE:
+        # Require actual_val_hours to be at least window size to ensure robust validation set
+        if actual_val_hours >= window:
             # Leak-free split
             train_feats.append(feats[:-actual_val_hours])
             train_targets.append(targets[:-actual_val_hours])
@@ -182,7 +193,7 @@ def split_tft_series(
 
 class TFTDataset(Dataset):
     """
-    PyTorch Dataset caching time-series sliding windows for zero-overhead batch loading.
+    PyTorch Dataset referencing time-series sliding windows lazily to prevent OOM on large datasets.
     """
     def __init__(
         self,
@@ -191,25 +202,25 @@ class TFTDataset(Dataset):
         input_size: int,
         forecast_size: int,
     ) -> None:
-        self.samples: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self.windows: List[Tuple[np.ndarray, np.ndarray, int]] = []
         window = input_size + forecast_size
 
         for feats, targets in zip(features_list, targets_list):
             if len(feats) < window:
                 continue
             for i in range(len(feats) - window + 1):
-                # VSN Input: historical features
-                x = feats[i : i + input_size].astype(np.float32)
-                # Quantile target: future tail latency values
-                y = targets[i + input_size : i + window].astype(np.float32)
-                
-                self.samples.append((torch.from_numpy(x), torch.from_numpy(y)))
+                self.windows.append((feats, targets, i))
+        self.input_size = input_size
+        self.forecast_size = forecast_size
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.windows)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.samples[idx]
+        feats, targets, i = self.windows[idx]
+        x = feats[i : i + self.input_size]
+        y = targets[i + self.input_size : i + self.input_size + self.forecast_size]
+        return torch.from_numpy(x.astype(np.float32)), torch.from_numpy(y.astype(np.float32))
 
 def train_tft(
     model: TemporalFusionTransformer,
@@ -224,7 +235,8 @@ def train_tft(
     """Train the TFT model using Quantile Loss with Early Stopping."""
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
+    # Switch to CosineAnnealingLR for stable decay across short training runs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-5)
     criterion = QuantileLoss(quantiles=model.quantiles)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -271,26 +283,30 @@ def train_tft(
                     val_total += criterion(y_pred, y_batch).item() * x_batch.size(0)
             val_loss = val_total / len(val_dataset)
         val_losses.append(val_loss)
-        scheduler.step(val_loss)
+        
+        # Step cosine scheduler
+        scheduler.step()
 
         # Early Stopping check
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            # Keep tensors on device during training to avoid CPU copy latency
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
             no_improve = 0
         else:
             no_improve += 1
             if no_improve >= patience:
                 break
 
-        if epoch % 10 == 0 or epoch == 1:
+        # Log at regular intervals (approx 10 times total)
+        log_interval = max(1, n_epochs // 10)
+        if epoch % log_interval == 0 or epoch == 1 or epoch == n_epochs:
             logger.info("Epoch %3d/%d | train_loss=%.4f | val_loss=%.4f | lr=%.2e",
                         epoch, n_epochs, epoch_loss, val_loss, optimizer.param_groups[0]["lr"])
 
     if best_state:
         model.load_state_dict(best_state)
-    model = model.to(device)
     
     logger.info("TFT Training Complete. Best Epoch: %d, Best Val Loss: %.4f", best_epoch, best_val_loss)
 
@@ -310,7 +326,7 @@ def main() -> int:
     features = load_features(PROJECT_ROOT)
     logger.info("Features loaded: %d rows", len(features))
 
-    volume_features, volume_targets, feature_scaler, target_scaler = prepare_hourly_latency(features)
+    volume_features, volume_targets, feature_scaler = prepare_hourly_latency(features, val_hours=72)
     n_volumes = len(volume_features)
     logger.info("Hourly series prepared: %d volumes, %d hours each",
                 n_volumes, next(iter(volume_features.values())).shape[0])
@@ -374,8 +390,8 @@ def main() -> int:
     results = []
     high_risk_count = 0
 
-    target_mean = float(target_scaler.mean_[0])
-    target_scale = float(target_scaler.scale_[0])
+    target_mean = float(feature_scaler.mean_[-1])
+    target_scale = float(feature_scaler.scale_[-1])
 
     with torch.no_grad():
         for vol_id in volume_features.keys():
@@ -388,12 +404,22 @@ def main() -> int:
             pred = model(x).cpu().numpy().squeeze(0) # [forecast_size, num_quantiles]
 
             # Unpack and unscale quantile forecasts
-            p50_forecast = np.clip(pred[:, 0] * target_scale + target_mean, 0.0, None)
-            p90_forecast = np.clip(pred[:, 1] * target_scale + target_mean, 0.0, None)
-            p95_forecast = np.clip(pred[:, 2] * target_scale + target_mean, 0.0, None)
+            p50_forecast = pred[:, 0] * target_scale + target_mean
+            p90_forecast = pred[:, 1] * target_scale + target_mean
+            p95_forecast = pred[:, 2] * target_scale + target_mean
+
+            # Enforce quantile monotonicity to prevent quantile crossing (p50 <= p90 <= p95)
+            forecasts = np.stack([p50_forecast, p90_forecast, p95_forecast], axis=1) # [forecast_size, 3]
+            forecasts = np.sort(forecasts, axis=1)
+            p50_forecast = np.clip(forecasts[:, 0], 0.0, None)
+            p90_forecast = np.clip(forecasts[:, 1], 0.0, None)
+            p95_forecast = np.clip(forecasts[:, 2], 0.0, None)
 
             max_p95_forecast = float(np.max(p95_forecast))
-            current_p95 = float(feats[-1, -1]) * target_scale + target_mean
+            
+            # Extract scaled current value from volume_targets to resolve Bug #2 / scaler decoupling
+            current_p95_scaled = volume_targets[vol_id][-1]
+            current_p95 = float(current_p95_scaled) * target_scale + target_mean
 
             # Identify if there is a tail latency risk breach forecasted
             is_risk = max_p95_forecast >= LATENCY_RISK_THRESHOLD_US
@@ -458,7 +484,7 @@ def main() -> int:
         },
         "statistics": {
             "total_volumes": n_volumes,
-            "high_risk_volumes": high_risk_count,
+            "at_risk_volumes": high_risk_count,
             "warning_volumes": sum(1 for r in results if r["severity"] == "warning"),
             "critical_volumes": sum(1 for r in results if r["severity"] == "critical"),
             "normal_volumes": sum(1 for r in results if r["severity"] == "normal")

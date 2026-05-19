@@ -32,8 +32,7 @@ class GRN(nn.Module):
             self.fc_context = nn.Linear(context_dim, d_hidden, bias=False)
         else:
             self.fc_context = None
-        self.fc2 = nn.Linear(d_hidden, d_out)
-        self.glu = GLU(d_out, d_out)
+        self.fc2 = nn.Linear(d_hidden, d_out * 2)
         self.gate_norm = nn.LayerNorm(d_out)
         
         if d_in != d_out:
@@ -50,7 +49,8 @@ class GRN(nn.Module):
         h = F.elu(h)
         h = self.fc2(h)
         h = self.dropout(h)
-        gated = self.glu(h)
+        val, gate = torch.chunk(h, 2, dim=-1)
+        gated = val * torch.sigmoid(gate)
         residual = self.res_proj(x)
         return self.gate_norm(gated + residual)
 
