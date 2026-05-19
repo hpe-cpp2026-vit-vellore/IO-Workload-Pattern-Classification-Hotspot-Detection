@@ -233,3 +233,7 @@ models/anomaly/ensemble_stats.json
 models/anomaly/noisy_neighbor/noisy_neighbor_events.json
 models/anomaly/noisy_neighbor/noisy_neighbor_report.csv
 models/anomaly/noisy_neighbor/noisy_neighbor_stats.json
+models/forecasting/dtf_forecast.csv
+models/forecasting/dtf_forecast.json
+models/forecasting/nbeats_model.pth
+models/forecasting/nbeats_training_stats.json
