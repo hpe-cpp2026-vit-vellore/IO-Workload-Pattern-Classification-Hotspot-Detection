@@ -8,6 +8,8 @@ what-if simulators, decision engines, and system performance indicators.
 """
 
 import sys
+import time
+import json
 import shap
 import uvicorn
 import asyncio
@@ -61,6 +63,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+try:
+    import redis
+except ImportError:  # Redis server/client is optional because TCP fallback is supported.
+    redis = None
+
 # Global engines
 hub: Optional[InferenceHub] = None
 rebalancer: Optional[Rebalancer] = None
@@ -69,12 +76,317 @@ engine: Optional[DecisionEngine] = None
 simulator: Optional[WhatIfSimulator] = None
 explainer: Optional[shap.TreeExplainer] = None
 
+# Active SSE connections
+active_streams: Dict[str, List[asyncio.Queue]] = {}
+
+# Telemetry bus configuration
+REDIS_HOST = "127.0.0.1"
+REDIS_PORT = 6379
+TCP_FALLBACK_HOST = "127.0.0.1"
+TCP_FALLBACK_PORT = 9000
+
+# Redis Client / TCP fallback state
+r: Optional[Any] = None
+use_redis: bool = False
+redis_error: Optional[str] = None
+tcp_server: Optional[Any] = None
+
+# Rate limiting for volume analyses (in seconds)
+last_analyzed_time: Dict[str, float] = {}
+analysis_tasks: Dict[str, asyncio.Task] = {}
+last_feature_trim_time: float = 0.0
+
+class RedisBackedCache(dict):
+    """Custom dictionary that dynamically reads live analysis data from Redis, falling back to local memory."""
+    def __getitem__(self, key):
+        global use_redis, r, hub
+        if use_redis and r is not None:
+            try:
+                data = r.hget(f"volume:{key}:analysis", "data")
+                if data:
+                    return json.loads(data)
+            except Exception as e:
+                logger.error(f"Error reading analysis for {key} from Redis: {e}")
+        try:
+            return super().__getitem__(key)
+        except KeyError:
+            if hub is not None:
+                val = hub.analyze_volume(key)
+                super().__setitem__(key, val)
+                return val
+            raise
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def items(self):
+        if hub is not None:
+            all_vols = hub.features_df["volume_id"].unique()
+        else:
+            all_vols = super().keys()
+        return [(v, self[v]) for v in all_vols]
+
+    def values(self):
+        if hub is not None:
+            all_vols = hub.features_df["volume_id"].unique()
+        else:
+            all_vols = super().keys()
+        return [self[v] for v in all_vols]
+
+    def __contains__(self, key):
+        if hub is not None:
+            return key in hub.features_df["volume_id"].unique()
+        return super().__contains__(key)
+
+    def __iter__(self):
+        if hub is not None:
+            return iter(hub.features_df["volume_id"].unique())
+        return super().__iter__()
+
+    def __len__(self):
+        if hub is not None:
+            return len(hub.features_df["volume_id"].unique())
+        return super().__len__()
+
 # In-memory cache for live telemetry state (warmup)
-cached_analysis: Dict[str, Dict[str, Any]] = {}
+cached_analysis = RedisBackedCache()
+
+def sync_topology_from_redis():
+    """Synchronizes in-memory topology metrics with latest metrics in Redis."""
+    global use_redis, r, hub
+    STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
+    if use_redis and r is not None and hub is not None:
+        try:
+            for vol_id in hub.features_df["volume_id"].unique():
+                metrics_data = r.hgetall(f"volume:{vol_id}:metrics")
+                if metrics_data:
+                    typed_metrics = {}
+                    for k, v in metrics_data.items():
+                        if k in STRING_COLS:
+                            typed_metrics[k] = v
+                        elif v is None or v == "" or v == "None":
+                            typed_metrics[k] = 0.0
+                        else:
+                            try:
+                                if "." in v:
+                                    typed_metrics[k] = float(v)
+                                else:
+                                    typed_metrics[k] = int(v)
+                            except ValueError:
+                                typed_metrics[k] = v
+                    hub.topology.update_volume_metrics(vol_id, typed_metrics)
+        except Exception as e:
+            logger.error(f"Error syncing topology from Redis: {e}")
+
+async def redis_stream_listener():
+    """Background task reading from Redis Stream to push live SSE metrics."""
+    global r, active_streams
+    last_id = "$"
+    STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
+    logger.info("Started FastAPI Redis Stream listener for live SSE updates.")
+    while True:
+        try:
+            if r is None:
+                await asyncio.sleep(2)
+                continue
+            res = await asyncio.to_thread(
+                r.xread,
+                streams={"telemetry:stream": last_id},
+                count=10,
+                block=1000
+            )
+            if not res:
+                continue
+            for stream_name, messages in res:
+                for msg_id, fields in messages:
+                    last_id = msg_id
+                    event = {}
+                    for k, v in fields.items():
+                        if k in STRING_COLS:
+                            event[k] = v
+                        elif v is None or v == "" or v == "None":
+                            event[k] = 0.0
+                        else:
+                            try:
+                                if "." in v:
+                                    event[k] = float(v)
+                                else:
+                                    event[k] = int(v)
+                            except ValueError:
+                                event[k] = v
+                    
+                    volume_id = event.get("volume_id")
+                    if volume_id:
+                        if volume_id in active_streams:
+                            payload = {
+                                "timestamp": event.get("timestamp"),
+                                "total_iops": float(event.get("total_iops", 0.0) or 0.0),
+                                "avg_latency_us": float(event.get("avg_latency_us", 0.0) or 0.0),
+                                "queue_depth": float(event.get("queue_depth", 0.0) or 0.0),
+                                "capacity_used_pct": float(event.get("capacity_used_pct", 0.0) or 0.0)
+                            }
+                            for q in active_streams[volume_id]:
+                                await q.put(payload)
+        except Exception as e:
+            logger.error(f"Error in redis_stream_listener: {e}")
+            await asyncio.sleep(2)
+
+def _append_feature_rows(rows: List[Dict[str, Any]]) -> None:
+    """Append live telemetry rows in batches to avoid per-record dataframe churn."""
+    global hub, last_feature_trim_time
+    if hub is None or not rows:
+        return
+
+    hub.features_df = pd.concat([hub.features_df, pd.DataFrame(rows)], ignore_index=True)
+
+    now = time.time()
+    if len(hub.features_df) > 15000 and (now - last_feature_trim_time > 60):
+        hub.features_df = hub.features_df.groupby("volume_id").tail(200).reset_index(drop=True)
+        last_feature_trim_time = now
+        logger.info("Trimmed live feature dataframe. Size: %s rows.", len(hub.features_df))
+
+async def _analyze_and_cache_volume(volume_id: str, ts: pd.Timestamp) -> None:
+    """Run heavier per-volume inference outside the ingestion hot path."""
+    global analysis_tasks
+    try:
+        if hub is not None:
+            cached_analysis[volume_id] = await asyncio.to_thread(hub.analyze_volume, volume_id, ts)
+    except Exception as e:
+        logger.error("Background analysis failed for %s at %s: %s", volume_id, ts, e)
+    finally:
+        analysis_tasks.pop(volume_id, None)
+
+def _schedule_volume_analysis(volume_id: str, ts: pd.Timestamp) -> None:
+    """Throttle background analysis so telemetry ingestion keeps the API responsive."""
+    now = time.time()
+    if now - last_analyzed_time.get(volume_id, 0.0) < 30.0:
+        return
+    task = analysis_tasks.get(volume_id)
+    if task is not None and not task.done():
+        return
+
+    last_analyzed_time[volume_id] = now
+    analysis_tasks[volume_id] = asyncio.create_task(_analyze_and_cache_volume(volume_id, ts))
+
+async def handle_tcp_client(reader, writer):
+    """TCP Handler for playback agent streaming metrics directly to FastAPI when Redis is offline."""
+    global hub, cached_analysis, active_streams, last_analyzed_time
+    
+    # Columns that should remain as strings
+    STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
+    
+    logger.info("TCP fallback client connected.")
+    pending_rows: List[Dict[str, Any]] = []
+    pending_analysis: Dict[str, pd.Timestamp] = {}
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            try:
+                data = json.loads(line.decode("utf-8").strip())
+                volume_id = data.get("volume_id")
+                timestamp_str = data.get("timestamp")
+                if volume_id and timestamp_str:
+                    ts = pd.to_datetime(timestamp_str)
+                    
+                    # Cast all non-string fields to proper numeric types
+                    event = {}
+                    for k, v in data.items():
+                        if k in STRING_COLS:
+                            event[k] = v
+                        elif v is None or v == "" or v == "None" or v == "NaN" or v == "nan":
+                            event[k] = 0.0
+                        elif isinstance(v, (int, float)):
+                            event[k] = float(v)
+                        else:
+                            # Try to parse string-encoded numbers
+                            try:
+                                event[k] = float(v)
+                            except (ValueError, TypeError):
+                                event[k] = 0.0
+                    
+                    event["timestamp"] = ts
+                    
+                    pending_rows.append(event)
+                    pending_analysis[volume_id] = ts
+                    if len(pending_rows) >= 250:
+                        _append_feature_rows(pending_rows)
+                        pending_rows.clear()
+                        for pending_volume_id, pending_ts in pending_analysis.items():
+                            _schedule_volume_analysis(pending_volume_id, pending_ts)
+                        pending_analysis.clear()
+                    
+                    # Update topology metrics
+                    hub.topology.update_volume_metrics(volume_id, event)
+                    
+                    # Push to SSE streams
+                    if volume_id in active_streams:
+                        payload = {
+                            "timestamp": timestamp_str,
+                            "total_iops": float(event.get("total_iops", 0.0) or 0.0),
+                            "avg_latency_us": float(event.get("avg_latency_us", 0.0) or 0.0),
+                            "queue_depth": float(event.get("queue_depth", 0.0) or 0.0),
+                            "capacity_used_pct": float(event.get("capacity_used_pct", 0.0) or 0.0)
+                        }
+                        for q in active_streams[volume_id]:
+                            await q.put(payload)
+            except Exception as ex:
+                logger.error(f"Error processing TCP record: {ex}")
+    except Exception as e:
+        logger.error(f"TCP fallback client error: {e}")
+    finally:
+        _append_feature_rows(pending_rows)
+        for pending_volume_id, pending_ts in pending_analysis.items():
+            _schedule_volume_analysis(pending_volume_id, pending_ts)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        logger.info("TCP fallback client disconnected.")
+
+async def _warmup_cache():
+    """Pre-warm the analysis cache in the background so startup is non-blocking."""
+    global hub, cached_analysis, last_analyzed_time
+    all_vols = hub.features_df["volume_id"].unique()
+    latest_ts = hub.features_df["timestamp"].max()
+    logger.info(f"Background cache warmup started for {len(all_vols)} volumes...")
+    
+    # Pre-populate last_analyzed_time to prevent immediate CPU overload on stream start
+    now = time.time()
+    for vol in all_vols:
+        last_analyzed_time[vol] = now
+
+    for i, vol in enumerate(all_vols):
+        try:
+            # Offload heavy ML inference to a thread pool
+            cached_analysis[vol] = await asyncio.to_thread(hub.analyze_volume, vol, latest_ts)
+        except Exception as e:
+            logger.error(f"Error pre-warming cache for volume {vol}: {e}")
+        # Yield control to the event loop every 5 volumes so the server stays responsive
+        if (i + 1) % 5 == 0:
+            await asyncio.sleep(0)
+    logger.info("Background cache warmup complete.")
+
+async def _start_tcp_fallback_server() -> None:
+    """Bind the TCP fallback listener and keep the server object alive."""
+    global tcp_server
+    tcp_server = await asyncio.start_server(
+        handle_tcp_client,
+        TCP_FALLBACK_HOST,
+        TCP_FALLBACK_PORT
+    )
+    sockets = tcp_server.sockets or []
+    bound = ", ".join(str(sock.getsockname()) for sock in sockets) or f"{TCP_FALLBACK_HOST}:{TCP_FALLBACK_PORT}"
+    logger.info("TCP fallback server listening on %s.", bound)
 
 @app.on_event("startup")
 async def startup_event():
-    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis
+    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis, r, use_redis, redis_error
     logger.info("Initializing Control Plane engines and loading ML models...")
     
     hub = InferenceHub(project_root=PROJECT_ROOT)
@@ -89,18 +401,62 @@ async def startup_event():
     # Initialize SHAP explainer
     explainer = shap.TreeExplainer(hub.classifier)
     
-    # Warmup analysis cache with the latest timestamp in the dataset
-    logger.info("Pre-warming volume analysis cache...")
-    all_vols = hub.features_df["volume_id"].unique()
-    latest_ts = hub.features_df["timestamp"].max()
-    
-    for vol in all_vols:
+    # Try to connect to Redis. If unavailable, the API owns a direct TCP fallback.
+    redis_error = None
+    if redis is None:
+        use_redis = False
+        redis_error = "Python package 'redis' is not installed."
+        logger.warning("%s Activating TCP fallback mode on port %s.", redis_error, TCP_FALLBACK_PORT)
+    else:
         try:
-            cached_analysis[vol] = hub.analyze_volume(vol, latest_ts)
+            r = redis.Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                decode_responses=True,
+                socket_connect_timeout=2
+            )
+            r.ping()
+            use_redis = True
+            logger.info("Successfully connected to Redis at %s:%s. Redis mode active.", REDIS_HOST, REDIS_PORT)
         except Exception as e:
-            logger.error(f"Error pre-warming cache for volume {vol}: {e}")
+            redis_error = str(e)
+            use_redis = False
+            r = None
+            logger.warning(
+                "Could not connect to Redis at %s:%s: %s. Activating TCP fallback mode on port %s.",
+                REDIS_HOST,
+                REDIS_PORT,
+                redis_error,
+                TCP_FALLBACK_PORT
+            )
+
+    # Start live stream background tasks
+    if use_redis:
+        asyncio.create_task(redis_stream_listener())
+    else:
+        try:
+            await _start_tcp_fallback_server()
+        except OSError as e:
+            logger.error(
+                "Could not bind TCP fallback server on %s:%s: %s",
+                TCP_FALLBACK_HOST,
+                TCP_FALLBACK_PORT,
+                e
+            )
+    
+    # Pre-warm cache in the BACKGROUND so /health responds immediately
+    asyncio.create_task(_warmup_cache())
             
-    logger.info("Control Plane engines and models successfully loaded.")
+    logger.info("Control Plane engines and models loaded. Server is ready (cache warming in background).")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close long-lived local servers cleanly on API shutdown."""
+    global tcp_server
+    if tcp_server is not None:
+        tcp_server.close()
+        await tcp_server.wait_closed()
+        tcp_server = None
 
 
 # Helper: Validate volume_id
@@ -117,7 +473,65 @@ def validate_volume(volume_id: str):
 @app.get("/health", status_code=status.HTTP_200_OK)
 def get_health():
     """Simple health check endpoint."""
-    return {"status": "healthy", "service": "HPE Storage API", "loaded_models": ["lightgbm", "isolation_forest", "lstm_ae", "nbeats", "tft"]}
+    return {
+        "status": "healthy" if hub is not None else "starting",
+        "service": "HPE Storage API",
+        "loaded_models": ["lightgbm", "isolation_forest", "lstm_ae", "nbeats", "tft"],
+        "telemetry_bus": {
+            "mode": "redis_streams" if use_redis else "tcp_fallback",
+            "redis": {
+                "available": bool(use_redis),
+                "host": REDIS_HOST,
+                "port": REDIS_PORT,
+                "error": redis_error,
+            },
+            "tcp_fallback": {
+                "enabled": not use_redis,
+                "host": TCP_FALLBACK_HOST,
+                "port": TCP_FALLBACK_PORT,
+                "listening": tcp_server is not None,
+            },
+        },
+    }
+
+
+@app.get("/kpi", status_code=status.HTTP_200_OK)
+def get_kpi():
+    """Aggregate KPIs across the entire storage pool for the dashboard overview."""
+    if hub is None:
+        return {
+            "avg_latency_us": 0.0,
+            "total_iops": 0.0,
+            "total_actions": 0,
+            "rolled_back_count": 0,
+            "rollback_rate_pct": 0.0,
+            "classifier_accuracy_target_pct": 95.0,
+            "latency_variance_reduction_target_pct": 30.0,
+        }
+    
+    latest_ts = hub.features_df["timestamp"].max()
+    latest_rows = hub.features_df[hub.features_df["timestamp"] == latest_ts]
+    
+    avg_latency = float(latest_rows["avg_latency_us"].mean()) if not latest_rows.empty else 0.0
+    total_iops = float(latest_rows["total_iops"].sum()) if not latest_rows.empty else 0.0
+    
+    mon_summary = {
+        "total_actions": 0,
+        "rolled_back_count": 0,
+        "rollback_rate_pct": 0.0,
+    }
+    if monitor is not None:
+        mon_summary = monitor.get_summary()
+    
+    return {
+        "avg_latency_us": round(avg_latency, 2),
+        "total_iops": round(total_iops, 2),
+        "total_actions": mon_summary["total_actions"],
+        "rolled_back_count": mon_summary["rolled_back_count"],
+        "rollback_rate_pct": mon_summary["rollback_rate_pct"],
+        "classifier_accuracy_target_pct": 95.0,
+        "latency_variance_reduction_target_pct": 30.0,
+    }
 
 
 @app.get("/volumes", status_code=status.HTTP_200_OK)
@@ -145,12 +559,37 @@ def get_volumes():
 def get_volume_metrics(id: str, limit: int = Query(100, ge=1, le=500)):
     """Retrieve historical time-series telemetry data for a volume."""
     validate_volume(id)
+    
+    if use_redis and r is not None:
+        try:
+            raw_items = r.lrange(f"volume:{id}:history", 0, limit - 1)
+            records = []
+            for item in raw_items:
+                event = json.loads(item)
+                records.append({
+                    "timestamp": event.get("timestamp"),
+                    "read_iops": float(event.get("read_iops", 0.0)),
+                    "write_iops": float(event.get("write_iops", 0.0)),
+                    "total_iops": float(event.get("total_iops", 0.0)),
+                    "read_throughput_mbps": float(event.get("read_throughput_mbps", 0.0)),
+                    "write_throughput_mbps": float(event.get("write_throughput_mbps", 0.0)),
+                    "avg_latency_us": float(event.get("avg_latency_us", 0.0)),
+                    "read_latency_p95_us": float(event.get("read_latency_p95_us", 0.0)),
+                    "write_latency_p95_us": float(event.get("write_latency_p95_us", 0.0)),
+                    "queue_depth": float(event.get("queue_depth", 0.0)),
+                    "capacity_used_pct": float(event.get("capacity_used_pct", 0.0))
+                })
+            records.reverse()
+            return records
+        except Exception as e:
+            logger.error(f"Error reading metrics for {id} from Redis: {e}")
+            
     df_vol = hub.features_df[hub.features_df["volume_id"] == id].sort_values("timestamp").tail(limit)
     
     records = []
     for _, row in df_vol.iterrows():
         records.append({
-            "timestamp": row["timestamp"].isoformat(),
+            "timestamp": row["timestamp"].isoformat() if isinstance(row["timestamp"], pd.Timestamp) else str(row["timestamp"]),
             "read_iops": float(row["read_iops"]),
             "write_iops": float(row["write_iops"]),
             "total_iops": float(row["total_iops"]),
@@ -171,18 +610,22 @@ def stream_volume_metrics(id: str):
     validate_volume(id)
     
     async def event_generator():
-        # Stream recent rows simulating continuous ingestion
-        df_vol = hub.features_df[hub.features_df["volume_id"] == id].sort_values("timestamp").tail(30)
-        for _, row in df_vol.iterrows():
-            payload = {
-                "timestamp": row["timestamp"].isoformat(),
-                "total_iops": float(row["total_iops"]),
-                "avg_latency_us": float(row["avg_latency_us"]),
-                "queue_depth": float(row["queue_depth"]),
-                "capacity_used_pct": float(row.get("capacity_used_pct", 0.0))
-            }
-            yield f"data: {payload}\n\n"
-            await asyncio.sleep(1.0) # Yield every 1 second
+        q = asyncio.Queue()
+        if id not in active_streams:
+            active_streams[id] = []
+        active_streams[id].append(q)
+        
+        try:
+            while True:
+                payload = await q.get()
+                yield f"data: {json.dumps(payload)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if id in active_streams and q in active_streams[id]:
+                active_streams[id].remove(q)
+                if not active_streams[id]:
+                    del active_streams[id]
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -354,6 +797,7 @@ def get_dtf_urgency():
 def post_simulate_capacity(req: SimulateCapacityRequest):
     """Simulate adding storage capacity (GB) to a volume."""
     validate_volume(req.volume_id)
+    sync_topology_from_redis()
     try:
         return simulator.simulate_add_capacity_scenario(req.volume_id, req.added_gb)
     except ValueError as e:
@@ -366,6 +810,7 @@ def post_simulate_capacity(req: SimulateCapacityRequest):
 def post_simulate_migrate(req: SimulateMigrateRequest):
     """Simulate moving a volume to another storage node."""
     validate_volume(req.volume_id)
+    sync_topology_from_redis()
     try:
         return simulator.simulate_migration_scenario(req.volume_id, req.target_node)
     except ValueError as e:
@@ -378,6 +823,7 @@ def post_simulate_migrate(req: SimulateMigrateRequest):
 def post_simulate_qos(req: SimulateQosRequest):
     """Simulate capping a volume's IOPS limit."""
     validate_volume(req.volume_id)
+    sync_topology_from_redis()
     try:
         return simulator.simulate_qos_shaping_scenario(req.volume_id, req.iops_limit)
     except ValueError as e:
@@ -390,6 +836,7 @@ def post_simulate_qos(req: SimulateQosRequest):
 def post_simulate_tier(req: SimulateTierRequest):
     """Simulate upgrading or downgrading a volume's storage tier."""
     validate_volume(req.volume_id)
+    sync_topology_from_redis()
     try:
         return simulator.simulate_tier_change_scenario(req.volume_id, req.new_tier)
     except ValueError as e:
@@ -403,6 +850,7 @@ def post_simulate_tier(req: SimulateTierRequest):
 @app.get("/recommendations", status_code=status.HTTP_200_OK)
 def get_recommendations():
     """Generates priority-sorted recommendations for active problems and forecasting limits."""
+    sync_topology_from_redis()
     recs = []
     
     for vol_id, analysis in cached_analysis.items():
@@ -481,9 +929,9 @@ def update_policy(req: PolicyUpdateRequest):
         safety = req.safety_guardrails.dict(exclude_none=True)
         engine.policy["safety_guardrails"].update(safety)
         if "rollback_if_target_latency_increases_pct" in safety:
-            monitor.rollback_threshold = safety["rollback_if_target_latency_increases_pct"]
+            monitor.rollback_threshold_pct = safety["rollback_if_target_latency_increases_pct"]
         if "rollback_timeout_minutes" in safety:
-            monitor.timeout = safety["rollback_timeout_minutes"]
+            monitor.rollback_timeout_minutes = safety["rollback_timeout_minutes"]
             
     return {"status": "success", "message": "Policy parameters updated successfully.", "policy": engine.policy}
 
@@ -494,6 +942,7 @@ def update_policy(req: PolicyUpdateRequest):
 def trigger_rebalance(req: RebalanceRequest):
     """Manually invoke a rebalance action (migrate, QoS shaping, or tier-change)."""
     validate_volume(req.volume_id)
+    sync_topology_from_redis()
     
     # Get current latency
     metrics_dict = hub.topology._volume_metrics.get(req.volume_id, {})
@@ -581,36 +1030,6 @@ def get_topology():
                 })
                 
     return {"nodes": nodes, "edges": edges}
-
-
-@app.get("/kpi", status_code=status.HTTP_200_OK)
-def get_kpis():
-    """Global system-wide KPIs."""
-    mon_summary = monitor.get_summary()
-    
-    # Calculate average latency across all volumes
-    all_latencies = [
-        float(hub.topology._volume_metrics[v].get("avg_latency_us", 0))
-        for v in hub.topology._volume_metrics
-    ]
-    avg_latency = float(np.mean(all_latencies)) if all_latencies else 1000.0
-    
-    # Total IOPS
-    all_iops = [
-        float(hub.topology._volume_metrics[v].get("total_iops", 0))
-        for v in hub.topology._volume_metrics
-    ]
-    total_iops = float(np.sum(all_iops))
-    
-    return {
-        "rollback_rate_pct": mon_summary["rollback_rate_pct"],
-        "total_actions": mon_summary["total_actions"],
-        "rolled_back_count": mon_summary["rolled_back_count"],
-        "avg_latency_us": round(avg_latency, 2),
-        "total_iops": round(total_iops, 2),
-        "classifier_accuracy_target_pct": 95.0,
-        "latency_variance_reduction_target_pct": 30.0
-    }
 
 if __name__ == "__main__":
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False)
