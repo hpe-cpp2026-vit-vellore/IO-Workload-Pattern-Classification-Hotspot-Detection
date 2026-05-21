@@ -10,6 +10,8 @@ and managing control plane policies.
 
 import sys
 import time
+import os
+import subprocess
 import requests
 import pandas as pd
 import numpy as np
@@ -19,13 +21,15 @@ import plotly.express as px
 import streamlit as st
 from pathlib import Path
 from typing import Any, List, Dict, Optional
+from urllib.parse import urlparse
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = os.getenv("HPE_API_URL", "http://127.0.0.1:8000").rstrip("/")
+API_LOG_PATH = PROJECT_ROOT / "api_server.log"
 
 # --- Page Configurations ---
 st.set_page_config(
@@ -153,13 +157,16 @@ def apply_dark_theme(fig):
 
 
 # --- API Fetch Wrappers ---
-def get_api_data(endpoint: str, params: dict = None) -> Any:
+def get_api_data(endpoint: str, params: dict = None, timeout: float = 5.0) -> Any:
     try:
-        response = requests.get(f"{API_URL}{endpoint}", params=params, timeout=5)
+        response = requests.get(f"{API_URL}{endpoint}", params=params, timeout=timeout)
         if response.status_code == 200:
+            st.session_state["last_api_error"] = None
             return response.json()
+        st.session_state["last_api_error"] = f"HTTP {response.status_code}: {response.text[:300]}"
         return None
-    except Exception:
+    except Exception as e:
+        st.session_state["last_api_error"] = str(e)
         return None
 
 def post_api_data(endpoint: str, payload: dict) -> Any:
@@ -168,6 +175,53 @@ def post_api_data(endpoint: str, payload: dict) -> Any:
         return response.json() if response.status_code == 200 else {"detail": response.text}
     except Exception as e:
         return {"detail": str(e)}
+
+def _local_python_executable() -> str:
+    venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
+
+def start_backend_api() -> bool:
+    """Start the local FastAPI control plane when the dashboard is opened first."""
+    cmd = [
+        _local_python_executable(),
+        "-m",
+        "uvicorn",
+        "api.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        with open(API_LOG_PATH, "a", encoding="utf-8") as log_file:
+            subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+            )
+        st.session_state["backend_autostart_cmd"] = " ".join(cmd)
+        return True
+    except Exception as e:
+        st.session_state["backend_autostart_error"] = str(e)
+        return False
+
+def wait_for_api(seconds: float = 60.0) -> Optional[dict]:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        health = get_api_data("/health", timeout=20.0)
+        if health:
+            return health
+        time.sleep(1.0)
+    return None
+
+def can_autostart_backend() -> bool:
+    parsed = urlparse(API_URL)
+    return parsed.hostname in {"127.0.0.1", "localhost"} and (parsed.port in {None, 8000})
 
 def put_api_data(endpoint: str, payload: dict) -> Any:
     try:
@@ -196,12 +250,46 @@ pages = [
 ]
 selected_page = st.sidebar.radio("Navigation Menu", pages)
 
-# Verify API connectivity
-health = get_api_data("/health")
+# Verify API connectivity. If the dashboard was opened first, boot the local API once.
+health = get_api_data("/health", timeout=20.0)
 if not health:
-    st.error("🚨 Backend Control Plane API is unreachable. Ensure the FastAPI service is running locally on port 8000.")
-    st.info("Run `python -m uvicorn api.main:app --port 8000 --reload` in your terminal to boot up the backend API.")
-    st.stop()
+    if can_autostart_backend() and not st.session_state.get("backend_autostart_attempted"):
+        st.session_state["backend_autostart_attempted"] = True
+        started = start_backend_api()
+        if started:
+            with st.spinner("Starting local FastAPI control plane on port 8000..."):
+                health = wait_for_api(seconds=75.0)
+        if health:
+            st.rerun()
+
+if not health:
+    st.error("Backend Control Plane API is unreachable on port 8000.")
+    st.info("Dashboard is running on port 8501, but the FastAPI control plane must also answer /health on port 8000.")
+    st.code("venv\\Scripts\\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8000", language="powershell")
+    st.code("venv\\Scripts\\python.exe scripts\\telemetry_playback.py", language="powershell")
+    if st.session_state.get("last_api_error"):
+        st.caption(f"Last API connection error: {st.session_state['last_api_error']}")
+    if st.session_state.get("backend_autostart_error"):
+        st.caption(f"Auto-start failed: {st.session_state['backend_autostart_error']}")
+    st.warning("Retrying API connection in 5 seconds...")
+    time.sleep(5)
+    st.rerun()
+
+telemetry_bus = health.get("telemetry_bus", {})
+if telemetry_bus:
+    if telemetry_bus.get("mode") == "redis_streams":
+        st.sidebar.success("Telemetry: Redis Streams")
+    else:
+        redis_error = telemetry_bus.get("redis", {}).get("error")
+        fallback = telemetry_bus.get("tcp_fallback", {})
+        if fallback.get("listening"):
+            st.sidebar.warning("Telemetry: TCP fallback")
+        else:
+            st.sidebar.error("Telemetry fallback not listening")
+        if redis_error:
+            st.sidebar.caption(f"Redis unavailable: {redis_error}")
+else:
+    st.sidebar.caption("Telemetry status unavailable until the API is restarted.")
 
 
 # ────────────────────────────────────────────────────────────────────
