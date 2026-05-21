@@ -18,6 +18,7 @@ import logging
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from collections import deque
 from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
@@ -94,7 +95,78 @@ tcp_server: Optional[Any] = None
 # Rate limiting for volume analyses (in seconds)
 last_analyzed_time: Dict[str, float] = {}
 analysis_tasks: Dict[str, asyncio.Task] = {}
-last_feature_trim_time: float = 0.0
+
+class LiveTelemetryState:
+    """In-memory live telemetry store separate from the historical/model dataframe."""
+
+    def __init__(self, history_limit: int = 500) -> None:
+        self.history_limit = history_limit
+        self.latest_by_volume: Dict[str, Dict[str, Any]] = {}
+        self.history_by_volume: Dict[str, deque] = {}
+        self.events_received = 0
+        self.current_tick: Optional[pd.Timestamp] = None
+        self.first_received_at: Optional[pd.Timestamp] = None
+        self.last_received_at: Optional[pd.Timestamp] = None
+
+    @staticmethod
+    def _copy_event(event: Dict[str, Any]) -> Dict[str, Any]:
+        copied = dict(event)
+        copied["timestamp"] = pd.to_datetime(copied["timestamp"])
+        return copied
+
+    def record(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        volume_id = event.get("volume_id")
+        if not volume_id or "timestamp" not in event:
+            return None
+
+        copied = self._copy_event(event)
+        volume_id = str(volume_id)
+        copied["volume_id"] = volume_id
+
+        self.latest_by_volume[volume_id] = copied
+        self.history_by_volume.setdefault(volume_id, deque(maxlen=self.history_limit)).append(copied)
+        self.events_received += 1
+        self.current_tick = copied["timestamp"]
+
+        now = pd.Timestamp.now()
+        if self.first_received_at is None:
+            self.first_received_at = now
+        self.last_received_at = now
+        return copied
+
+    def latest_rows(self) -> List[Dict[str, Any]]:
+        return list(self.latest_by_volume.values())
+
+    def current_tick_rows(self) -> List[Dict[str, Any]]:
+        if self.current_tick is None:
+            return []
+        return [
+            row for row in self.latest_by_volume.values()
+            if row.get("timestamp") == self.current_tick
+        ]
+
+    def history(self, volume_id: str, limit: int) -> List[Dict[str, Any]]:
+        rows = list(self.history_by_volume.get(volume_id, []))
+        if limit:
+            rows = rows[-limit:]
+        return rows
+
+    def status(self, expected_volume_count: Optional[int] = None) -> Dict[str, Any]:
+        current_rows = self.current_tick_rows()
+        current_tick_volume_count = len(current_rows)
+        return {
+            "events_received": self.events_received,
+            "live_volume_count": len(self.latest_by_volume),
+            "expected_volume_count": expected_volume_count,
+            "current_tick": self.current_tick.isoformat() if self.current_tick is not None else None,
+            "current_tick_volume_count": current_tick_volume_count,
+            "current_tick_complete": (
+                current_tick_volume_count >= expected_volume_count
+                if expected_volume_count is not None else False
+            ),
+            "first_received_at": self.first_received_at.isoformat() if self.first_received_at is not None else None,
+            "last_received_at": self.last_received_at.isoformat() if self.last_received_at is not None else None,
+        }
 
 class RedisBackedCache(dict):
     """Custom dictionary that dynamically reads live analysis data from Redis, falling back to local memory."""
@@ -153,6 +225,7 @@ class RedisBackedCache(dict):
 
 # In-memory cache for live telemetry state (warmup)
 cached_analysis = RedisBackedCache()
+live_state = LiveTelemetryState()
 
 def sync_topology_from_redis():
     """Synchronizes in-memory topology metrics with latest metrics in Redis."""
@@ -180,6 +253,14 @@ def sync_topology_from_redis():
                     hub.topology.update_volume_metrics(vol_id, typed_metrics)
         except Exception as e:
             logger.error(f"Error syncing topology from Redis: {e}")
+
+def get_expected_volume_count() -> Optional[int]:
+    if hub is None:
+        return None
+    try:
+        return len(hub.topology.all_volumes())
+    except Exception:
+        return int(hub.features_df["volume_id"].nunique())
 
 async def redis_stream_listener():
     """Background task reading from Redis Stream to push live SSE metrics."""
@@ -220,9 +301,14 @@ async def redis_stream_listener():
                     
                     volume_id = event.get("volume_id")
                     if volume_id:
+                        timestamp_str = event.get("timestamp")
+                        event["timestamp"] = pd.to_datetime(timestamp_str)
+                        live_state.record(event)
+                        if hub is not None:
+                            hub.topology.update_volume_metrics(volume_id, event)
                         if volume_id in active_streams:
                             payload = {
-                                "timestamp": event.get("timestamp"),
+                                "timestamp": str(timestamp_str),
                                 "total_iops": float(event.get("total_iops", 0.0) or 0.0),
                                 "avg_latency_us": float(event.get("avg_latency_us", 0.0) or 0.0),
                                 "queue_depth": float(event.get("queue_depth", 0.0) or 0.0),
@@ -235,18 +321,8 @@ async def redis_stream_listener():
             await asyncio.sleep(2)
 
 def _append_feature_rows(rows: List[Dict[str, Any]]) -> None:
-    """Append live telemetry rows in batches to avoid per-record dataframe churn."""
-    global hub, last_feature_trim_time
-    if hub is None or not rows:
-        return
-
-    hub.features_df = pd.concat([hub.features_df, pd.DataFrame(rows)], ignore_index=True)
-
-    now = time.time()
-    if len(hub.features_df) > 15000 and (now - last_feature_trim_time > 60):
-        hub.features_df = hub.features_df.groupby("volume_id").tail(200).reset_index(drop=True)
-        last_feature_trim_time = now
-        logger.info("Trimmed live feature dataframe. Size: %s rows.", len(hub.features_df))
+    """Deprecated compatibility hook: live rows now stay out of hub.features_df."""
+    return
 
 async def _analyze_and_cache_volume(volume_id: str, ts: pd.Timestamp) -> None:
     """Run heavier per-volume inference outside the ingestion hot path."""
@@ -310,6 +386,7 @@ async def handle_tcp_client(reader, writer):
                                 event[k] = 0.0
                     
                     event["timestamp"] = ts
+                    live_state.record(event)
                     
                     pending_rows.append(event)
                     pending_analysis[volume_id] = ts
@@ -492,7 +569,14 @@ def get_health():
                 "listening": tcp_server is not None,
             },
         },
+        "live_telemetry": live_state.status(get_expected_volume_count()),
     }
+
+
+@app.get("/telemetry/status", status_code=status.HTTP_200_OK)
+def get_telemetry_status():
+    """Inspect API-owned live telemetry state without relying on dashboard pages."""
+    return live_state.status(get_expected_volume_count())
 
 
 @app.get("/kpi", status_code=status.HTTP_200_OK)
