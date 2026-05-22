@@ -426,7 +426,7 @@ if selected_page == "Live Overview":
                 hovertemplate="Volume: %{customdata}<br>Score: %{z:.1f}<extra></extra>"
             )
             apply_dark_theme(fig)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             
     with mcol2:
         st.subheader("Top Critical & High Alerts")
@@ -468,7 +468,7 @@ if selected_page == "Live Overview":
         )
         apply_dark_theme(fig_pie)
         fig_pie.update_layout(height=350)
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, width="stretch")
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -553,13 +553,13 @@ elif selected_page == "Volume Deep Dive":
         ))
         apply_dark_theme(fig_gauge)
         fig_gauge.update_layout(height=280, margin=dict(t=80, b=20, l=30, r=30))
-        st.plotly_chart(fig_gauge, use_container_width=True)
+        st.plotly_chart(fig_gauge, width="stretch")
         
     with dcol2:
         # Workload classification confidence
         if workload:
             confidence = workload["confidence"]
-            classes = ["Sequential_Read", "Sequential_Write", "Random_Read", "Random_Write", "AI_Training"]
+            classes = ["DB_OLTP", "VM", "Backup", "AI_Training", "AI_Inference"]
             fig_conf = px.bar(
                 x=confidence,
                 y=classes,
@@ -570,7 +570,7 @@ elif selected_page == "Volume Deep Dive":
             apply_dark_theme(fig_conf)
             fig_conf.update_traces(marker_color='#7b2cbf')
             fig_conf.update_layout(height=280)
-            st.plotly_chart(fig_conf, use_container_width=True)
+            st.plotly_chart(fig_conf, width="stretch")
             
     with dcol3:
         # Diagnostics details — use live metrics when available
@@ -608,7 +608,7 @@ elif selected_page == "Volume Deep Dive":
         )
         apply_dark_theme(fig_shap)
         fig_shap.update_layout(height=350)
-        st.plotly_chart(fig_shap, use_container_width=True)
+        st.plotly_chart(fig_shap, width="stretch")
         
     # Latency chart
     chart_source = "Live Telemetry" if vol_is_live else "Historical Parquet"
@@ -620,7 +620,7 @@ elif selected_page == "Volume Deep Dive":
     
     apply_dark_theme(fig_lat)
     fig_lat.update_layout(height=350, yaxis_title="Latency (µs)")
-    st.plotly_chart(fig_lat, use_container_width=True)
+    st.plotly_chart(fig_lat, width="stretch")
     
     # Auto-refresh when live telemetry is flowing
     if vol_is_live:
@@ -658,7 +658,7 @@ elif selected_page == "Capacity Planning":
     with col_t:
         st.subheader("Days-to-Fill Urgency Ranking")
         styled_df = df_dtf.style.map(style_dtf, subset=["warning_85pct_days", "critical_95pct_days"])
-        st.dataframe(styled_df, use_container_width=True, height=450)
+        st.dataframe(styled_df, width="stretch", height=450)
         
     with col_s:
         st.subheader("What-If Capacity Extension Simulator")
@@ -684,6 +684,12 @@ elif selected_page == "Capacity Planning":
                     <p><em>Recommendation: {res['recommendation']}</em></p>
                 </div>
                 """, unsafe_allow_html=True)
+
+    # Auto-refresh Page 3 if live telemetry is active
+    kpi_data = get_api_data("/kpi") or {}
+    if kpi_data.get("is_live", False):
+        time.sleep(5)
+        st.rerun()
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -817,7 +823,7 @@ elif selected_page == "Hotspot & Noisy Neighbors":
                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                 height=450
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             
     with col_n:
         st.subheader("Detected Noisy Neighbors")
@@ -836,6 +842,12 @@ elif selected_page == "Hotspot & Noisy Neighbors":
                 """, unsafe_allow_html=True)
         else:
             st.success("🟢 No noisy-neighbor aggression detected in current telemetry.")
+
+    # Auto-refresh Page 4 if live telemetry is active
+    kpi_data = get_api_data("/kpi") or {}
+    if kpi_data.get("is_live", False):
+        time.sleep(5)
+        st.rerun()
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -877,7 +889,13 @@ elif selected_page == "Bandwidth & Latency Forecasts":
     
     apply_dark_theme(fig)
     fig.update_layout(height=400, yaxis_title="Latency / Demand Projection (µs)", xaxis_title="Forecast Window")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+
+    # Auto-refresh Page 5 if live telemetry is active
+    kpi_data = get_api_data("/kpi") or {}
+    if kpi_data.get("is_live", False):
+        time.sleep(5)
+        st.rerun()
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -889,7 +907,50 @@ elif selected_page == "Rebalancing History & Control":
     
     policy = get_api_data("/policy") or {}
     kpi_data = get_api_data("/kpi") or {}
+    monitors = get_api_data("/rebalance/monitors") or {}
+    history = get_api_data("/rebalance/history") or []
     
+    # Calculate monitor metrics
+    active_monitors_count = sum(1 for m in monitors.values() if m.get("status") == "monitoring")
+    success_count = sum(1 for m in monitors.values() if m.get("status") == "success")
+    rolled_back_count = sum(1 for m in monitors.values() if m.get("status") == "rolled_back")
+    total_monitors = len(monitors)
+    rollback_rate = (rolled_back_count / total_monitors * 100.0) if total_monitors > 0 else 0.0
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Active Monitors</div>
+            <div class="metric-value">{active_monitors_count}</div>
+            <div class="metric-subtitle">Currently tracked operations</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_m2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Success Actions</div>
+            <div class="metric-value">{success_count}</div>
+            <div class="metric-subtitle">Completed without latency spike</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_m3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Rollbacks Tripped</div>
+            <div class="metric-value">{rolled_back_count}</div>
+            <div class="metric-subtitle">Automatic reverts executed</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col_m4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Rollback Rate</div>
+            <div class="metric-value">{rollback_rate:.2f}%</div>
+            <div class="metric-subtitle">SLO target < 1.0%</div>
+        </div>
+        """, unsafe_allow_html=True)
+
     pcol1, pcol2 = st.columns([1, 1])
     
     with pcol1:
@@ -958,6 +1019,95 @@ elif selected_page == "Rebalancing History & Control":
                 else:
                     st.error(f"Rollback execution failed: {res.get('detail', 'Unknown error')}")
 
+    st.subheader("Active Rebalance Monitors")
+    active_monitors = [m for m in monitors.values() if m.get("status") == "monitoring"]
+    if not active_monitors:
+        st.info("No active rebalance monitors running.")
+    else:
+        # Render table header
+        h_cols = st.columns([2, 1, 1, 1.2, 1.8, 1.8, 1])
+        h_cols[0].markdown("**Action ID**")
+        h_cols[1].markdown("**Volume**")
+        h_cols[2].markdown("**Type**")
+        h_cols[3].markdown("**Elapsed**")
+        h_cols[4].markdown("**Pre/Live Latency**")
+        h_cols[5].markdown("**Target Details**")
+        h_cols[6].markdown("**Action**")
+        
+        st.markdown("---")
+        for mon in active_monitors:
+            aid = mon["action_id"]
+            vol_id = mon["action_state"].get("volume_id", "—")
+            act_type = mon["action_state"].get("action", "—")
+            elapsed = f"{mon.get('elapsed_minutes', 0.0):.1f} min"
+            pre_lat = f"{mon.get('pre_latency', 0.0):.1f} µs"
+            curr_lat = f"{mon.get('current_latency', 0.0):.1f} µs"
+            
+            # Details target
+            if act_type == "migrate":
+                target_details = f"Node: {mon['action_state'].get('target_node', '—')}"
+            elif act_type == "qos":
+                target_details = f"Limit: {mon['action_state'].get('new_iops_limit', '—')} IOPS"
+            elif act_type == "tier_change":
+                target_details = f"Tier: {mon['action_state'].get('new_tier', '—')}"
+            else:
+                target_details = "—"
+                
+            r_cols = st.columns([2, 1, 1, 1.2, 1.8, 1.8, 1])
+            r_cols[0].caption(aid)
+            r_cols[1].write(vol_id)
+            r_cols[2].write(act_type)
+            r_cols[3].write(elapsed)
+            r_cols[4].write(f"{pre_lat} → {curr_lat}")
+            r_cols[5].write(target_details)
+            
+            # Unique key for button
+            if r_cols[6].button("Rollback", key=f"rb_{aid}"):
+                payload = {"action_id": aid}
+                res = post_api_data("/rollback", payload)
+                if "status" in res and res["status"] == "success":
+                    st.success(f"Successfully rolled back {vol_id}!")
+                    time.sleep(1.0)
+                    st.rerun()
+                else:
+                    st.error(f"Failed: {res.get('detail', 'Unknown error')}")
+
+    st.subheader("Rebalancing History Log")
+    if not history:
+        st.info("No rebalancing history recorded.")
+    else:
+        hist_df = pd.DataFrame(history)
+        if "timestamp" in hist_df.columns:
+            hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
+            hist_df = hist_df.sort_values("timestamp", ascending=False)
+        
+        display_rows = []
+        for _, row in hist_df.iterrows():
+            ts_str = row["timestamp"].strftime("%Y-%m-%d %H:%M:%S") if isinstance(row["timestamp"], pd.Timestamp) else str(row["timestamp"])
+            choice = row.get("choice") or {}
+            details = ""
+            if row["action"] == "migrate":
+                details = f"Target Node: {choice.get('target_node')}"
+            elif row["action"] == "qos":
+                details = f"IOPS Limit: {choice.get('iops_limit')}"
+            elif row["action"] == "tier_change":
+                details = f"New Tier: {choice.get('new_tier')}"
+                
+            display_rows.append({
+                "Time": ts_str,
+                "Action ID": row.get("action_id", "—"),
+                "Volume ID": row.get("volume_id", "—"),
+                "Action Type": row.get("action", "—"),
+                "Status": row.get("status", "—"),
+                "Execution Details": details
+            })
+        st.dataframe(pd.DataFrame(display_rows), width="stretch", height=300)
+
+    # Auto-refresh Page 6 if live telemetry is active
+    if kpi_data.get("is_live", False):
+        time.sleep(5)
+        st.rerun()
+
 
 # ────────────────────────────────────────────────────────────────────
 # PAGE 7: ML MODEL PERFORMANCE
@@ -966,42 +1116,82 @@ elif selected_page == "ML Model Performance":
     st.markdown("<h1>📊 ML Model Performance Indicators</h1>", unsafe_allow_html=True)
     st.markdown("Validation metrics, feature importances, and model deployment details.", unsafe_allow_html=True)
     
+    perf_data = get_api_data("/model/performance")
+    if not perf_data:
+        last_error = st.session_state.get("last_api_error")
+        if last_error:
+            st.error(f"Failed to fetch model performance from FastAPI. {last_error}")
+        else:
+            st.error("Failed to fetch model performance from FastAPI.")
+        st.stop()
+        
+    accuracy = perf_data.get("accuracy", 0.0) * 100.0
+    sample_count = perf_data.get("sample_count", 0)
+    cm_perc = perf_data.get("confusion_matrix_percentage", [])
+    metrics_per_class = perf_data.get("metrics_per_class", {})
+    
+    classes = ["DB_OLTP", "VM", "Backup", "AI_Training", "AI_Inference"]
+    
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Validation Accuracy</div>
+            <div class="metric-value">{accuracy:.2f}%</div>
+            <div class="metric-subtitle">Overall classifier accuracy</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with pcol2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Validation Sample Count</div>
+            <div class="metric-value">{sample_count:,}</div>
+            <div class="metric-subtitle">Total time-series snapshots evaluated</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
     mcol1, mcol2 = st.columns([1, 1])
     
     with mcol1:
-        st.subheader("Confusion Matrix (Workload Classifier)")
-        # Static representation of model accuracy
-        classes = ["Sequential_Read", "Sequential_Write", "Random_Read", "Random_Write", "AI_Training"]
-        z = [
-            [96, 2, 1, 1, 0],
-            [1, 95, 2, 2, 0],
-            [2, 2, 94, 2, 0],
-            [1, 1, 3, 95, 0],
-            [0, 0, 0, 0, 100]
-        ]
-        fig_cm = px.imshow(
-            z,
-            x=classes,
-            y=classes,
-            labels=dict(x="Predicted", y="Actual", color="Accuracy %"),
-            color_continuous_scale="Purples",
-            text_auto=True
-        )
-        apply_dark_theme(fig_cm)
-        st.plotly_chart(fig_cm, use_container_width=True)
-        
+        st.subheader("Confusion Matrix (%)")
+        if cm_perc:
+            fig_cm = px.imshow(
+                cm_perc,
+                x=classes,
+                y=classes,
+                labels=dict(x="Predicted Workload", y="Actual Workload", color="Percentage (%)"),
+                color_continuous_scale="Purples",
+                text_auto=True
+            )
+            apply_dark_theme(fig_cm)
+            st.plotly_chart(fig_cm, width="stretch")
+            
     with mcol2:
-        st.subheader("Model Performance Details")
+        st.subheader("Class-Wise Performance Metrics")
+        if metrics_per_class:
+            class_perf_rows = []
+            for cls_name, metrics in metrics_per_class.items():
+                class_perf_rows.append({
+                    "Workload Class": cls_name,
+                    "Precision": f"{metrics.get('precision', 0.0)*100:.2f}%",
+                    "Recall": f"{metrics.get('recall', 0.0)*100:.2f}%",
+                    "F1-Score": f"{metrics.get('f1_score', 0.0)*100:.2f}%",
+                    "Support (Samples)": f"{metrics.get('support', 0):,}"
+                })
+            perf_df = pd.DataFrame(class_perf_rows)
+            st.dataframe(perf_df, width="stretch", hide_index=True)
+            
+        st.subheader("Model Architecture & Hardware Metadata")
         st.markdown("""
-        <div class="metric-card" style="height: 380px;">
-            <div class="metric-title">Deployment Metadata</div>
-            <p><strong>LightGBM Workload Classifier:</strong> Version 2.1.4 (Accuracy: 96.0%)</p>
-            <p><strong>Isolation Forest Anomaly Detector:</strong> Version 1.0.2 (F1-Score: 92.5%)</p>
-            <p><strong>LSTM Autoencoder:</strong> PyTorch Model (Reconstruction Threshold: 0.15)</p>
-            <p><strong>N-BEATS Capacity Forecaster:</strong> Version 1.3.0 (MAPE: 2.1%)</p>
-            <p><strong>Temporal Fusion Transformer:</strong> Version 1.1.0 (Quantile Loss: 0.1832)</p>
+        <div class="metric-card">
+            <div class="metric-title">Deployment Pipeline Metadata</div>
+            <p><strong>LightGBM Workload Classifier:</strong> Ensemble model using temporal lag features</p>
+            <p><strong>Isolation Forest Anomaly Detector:</strong> Outlier detection on high-frequency queue metrics</p>
+            <p><strong>LSTM Autoencoder:</strong> PyTorch based reconstruction loss thresholding for SLA risk detection</p>
+            <p><strong>N-BEATS Capacity Forecaster:</strong> Time-series deep learning for DTF capacity projections</p>
+            <p><strong>Temporal Fusion Transformer:</strong> Quantile multi-horizon tail latency predictor</p>
             <hr style="border-color:rgba(255,255,255,0.05)"/>
-            <p><strong>Deployment Date:</strong> May 19, 2026</p>
-            <p><strong>Target Acceleration Device:</strong> CPU (Auto-Fallbacks Enabled)</p>
+            <p><strong>Target Execution Device:</strong> CPU (Auto-Fallbacks Enabled for portable execution)</p>
         </div>
         """, unsafe_allow_html=True)
+
