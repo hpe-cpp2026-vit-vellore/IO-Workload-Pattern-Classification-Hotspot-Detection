@@ -241,3 +241,5 @@ models/forecasting/tft_latency_forecast.json
 models/forecasting/tft_latency_forecast.csv
 models/forecasting/tft_model.pth
 models/forecasting/tft_training_stats.json
+models/telemetry_parser.dll
+models/bounds.json
