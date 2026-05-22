@@ -81,10 +81,84 @@ explainer: Optional[shap.TreeExplainer] = None
 active_streams: Dict[str, List[asyncio.Queue]] = {}
 
 # Telemetry bus configuration
-REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
 TCP_FALLBACK_HOST = "127.0.0.1"
 TCP_FALLBACK_PORT = 9000
+# REDIS_HOST is detected lazily in startup_event() so WSL2 networking is ready
+REDIS_HOST = "127.0.0.1"
+
+
+import atexit
+_wsl_keepalive_proc = None
+
+def _start_wsl_keepalive(host: str):
+    """Start a background WSL session to prevent idle VM shutdown when host is WSL IP."""
+    global _wsl_keepalive_proc
+    if host != "127.0.0.1" and host != "localhost" and _wsl_keepalive_proc is None:
+        import subprocess
+        try:
+            creationflags = 0
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW
+            except AttributeError:
+                pass
+            _wsl_keepalive_proc = subprocess.Popen(
+                ["wsl", "sleep", "infinity"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags
+            )
+            logger.info("Started WSL keepalive process to prevent idle VM shutdown (PID: %s)", _wsl_keepalive_proc.pid)
+            atexit.register(_stop_wsl_keepalive)
+        except Exception as e:
+            logger.warning("Failed to start WSL keepalive process: %s", e)
+
+def _stop_wsl_keepalive():
+    """Stop the background WSL keepalive process cleanly on exit."""
+    global _wsl_keepalive_proc
+    if _wsl_keepalive_proc is not None:
+        try:
+            _wsl_keepalive_proc.terminate()
+            _wsl_keepalive_proc.wait(timeout=1)
+            logger.info("Stopped WSL keepalive process.")
+        except Exception:
+            try:
+                _wsl_keepalive_proc.kill()
+            except Exception:
+                pass
+        _wsl_keepalive_proc = None
+
+def _detect_redis_host() -> str:
+    """Auto-detect the best Redis host address (handles WSL2 networking).
+
+    Priority: WSL2 VM IP > 127.0.0.1.
+    'localhost' is deliberately excluded because Windows resolves it
+    through a flaky WSL2 NAT layer that drops long-lived TCP connections.
+    """
+    import subprocess, socket as _sock
+    candidates = []
+    try:
+        result = subprocess.run(
+            ["wsl", "hostname", "-I"],
+            capture_output=True, text=True, timeout=5
+        )
+        wsl_ip = result.stdout.strip().split()[0] if result.returncode == 0 else None
+        if wsl_ip:
+            candidates.append(wsl_ip)
+    except Exception:
+        pass
+    candidates.append("127.0.0.1")
+
+    for host in candidates:
+        try:
+            with _sock.create_connection((host, REDIS_PORT), timeout=2):
+                logger.info("Detected Redis reachable at %s:%s", host, REDIS_PORT)
+                return host
+        except OSError:
+            logger.debug("Redis not reachable at %s:%s, trying next candidate.", host, REDIS_PORT)
+            continue
+    logger.warning("Could not detect Redis host. Defaulting to 127.0.0.1.")
+    return "127.0.0.1"
 
 # Redis Client / TCP fallback state
 r: Optional[Any] = None
@@ -186,6 +260,8 @@ class LiveTelemetryState:
 
 class RedisBackedCache(dict):
     """Custom dictionary that dynamically reads live analysis data from Redis, falling back to local memory."""
+    _redis_error_logged_at: float = 0.0  # rate-limit Redis error logging
+
     def __getitem__(self, key):
         global use_redis, r, hub
         if use_redis and r is not None:
@@ -194,7 +270,11 @@ class RedisBackedCache(dict):
                 if data:
                     return json.loads(data)
             except Exception as e:
-                logger.error(f"Error reading analysis for {key} from Redis: {e}")
+                # Rate-limit error logging to once every 30 seconds
+                now = time.time()
+                if now - RedisBackedCache._redis_error_logged_at > 30.0:
+                    logger.warning("Redis cache read failing (will retry silently): %s", e)
+                    RedisBackedCache._redis_error_logged_at = now
         try:
             return super().__getitem__(key)
         except KeyError:
@@ -278,11 +358,45 @@ def get_expected_volume_count() -> Optional[int]:
     except Exception:
         return int(hub.features_df["volume_id"].nunique())
 
+def _create_redis_client() -> Any:
+    """Create a new Redis client with resilient WSL2-friendly settings."""
+    detected_host = _detect_redis_host()
+    logger.info("Creating Redis client targeting %s:%s", detected_host, REDIS_PORT)
+    
+    # Start WSL keepalive if connecting to WSL IP
+    _start_wsl_keepalive(detected_host)
+    
+    import socket
+    socket_keepalive_options = {}
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        socket_keepalive_options[socket.TCP_KEEPIDLE] = 10
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        socket_keepalive_options[socket.TCP_KEEPINTVL] = 5
+    if hasattr(socket, "TCP_KEEPCNT"):
+        socket_keepalive_options[socket.TCP_KEEPCNT] = 3
+
+    return redis.Redis(
+        host=detected_host,
+        port=REDIS_PORT,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=5,
+        socket_keepalive=True,
+        socket_keepalive_options=socket_keepalive_options,
+        retry_on_timeout=True,
+        health_check_interval=15,
+    )
+
+
 async def redis_stream_listener():
-    """Background task reading from Redis Stream to push live SSE metrics."""
+    """Background task reading from Redis Stream to push live SSE metrics.
+
+    Automatically reconnects when the WSL2 NAT layer drops the connection.
+    """
     global r, active_streams
     last_id = "$"
     STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
+    consecutive_errors = 0
     logger.info("Started FastAPI Redis Stream listener for live SSE updates.")
     while True:
         try:
@@ -295,6 +409,7 @@ async def redis_stream_listener():
                 count=10,
                 block=1000
             )
+            consecutive_errors = 0  # reset on success
             if not res:
                 continue
             for stream_name, messages in res:
@@ -333,8 +448,20 @@ async def redis_stream_listener():
                             for q in active_streams[volume_id]:
                                 await q.put(payload)
         except Exception as e:
-            logger.error(f"Error in redis_stream_listener: {e}")
-            await asyncio.sleep(2)
+            consecutive_errors += 1
+            if consecutive_errors <= 3 or consecutive_errors % 30 == 0:
+                logger.error("redis_stream_listener error #%d: %s", consecutive_errors, e)
+            # After 3 consecutive failures, try to rebuild the connection
+            if consecutive_errors >= 3:
+                logger.warning("Rebuilding Redis connection after %d consecutive errors...", consecutive_errors)
+                try:
+                    r = _create_redis_client()
+                    r.ping()
+                    logger.info("Redis reconnection successful.")
+                    consecutive_errors = 0
+                except Exception as re_err:
+                    logger.warning("Redis reconnection failed: %s. Will retry in 5s.", re_err)
+            await asyncio.sleep(min(5, 2 * consecutive_errors))
 MAX_ROWS_PER_VOLUME = 500  # model inference context window per volume
 
 def _append_feature_rows(rows: List[Dict[str, Any]]) -> None:
@@ -526,6 +653,9 @@ async def startup_event():
     if expected_count:
         live_state.set_expected_volume_count(expected_count)
     
+    # Detect Redis host NOW (not at import time) so WSL2 networking is fully ready.
+    REDIS_HOST = _detect_redis_host()
+
     # Try to connect to Redis. If unavailable, the API owns a direct TCP fallback.
     redis_error = None
     if redis is None:
@@ -534,12 +664,7 @@ async def startup_event():
         logger.warning("%s Activating TCP fallback mode on port %s.", redis_error, TCP_FALLBACK_PORT)
     else:
         try:
-            r = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                decode_responses=True,
-                socket_connect_timeout=2
-            )
+            r = _create_redis_client()
             r.ping()
             use_redis = True
             logger.info("Successfully connected to Redis at %s:%s. Redis mode active.", REDIS_HOST, REDIS_PORT)

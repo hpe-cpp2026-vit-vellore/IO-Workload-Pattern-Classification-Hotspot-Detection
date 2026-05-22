@@ -28,10 +28,88 @@ logger = logging.getLogger("playback_agent")
 
 PARQUET_PATH = PROJECT_ROOT / "data" / "processed" / "io_features.parquet"
 CSV_PATH = PROJECT_ROOT / "data" / "processed" / "io_features.csv"
-REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
 TCP_FALLBACK_HOST = "127.0.0.1"
 TCP_FALLBACK_PORT = 9000
+
+
+import atexit
+_wsl_keepalive_proc = None
+
+def _start_wsl_keepalive(host: str):
+    """Start a background WSL session to prevent idle VM shutdown when host is WSL IP."""
+    global _wsl_keepalive_proc
+    if host != "127.0.0.1" and host != "localhost" and _wsl_keepalive_proc is None:
+        import subprocess
+        try:
+            creationflags = 0
+            try:
+                creationflags = subprocess.CREATE_NO_WINDOW
+            except AttributeError:
+                pass
+            _wsl_keepalive_proc = subprocess.Popen(
+                ["wsl", "sleep", "infinity"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags
+            )
+            logger.info("Started WSL keepalive process to prevent idle VM shutdown (PID: %s)", _wsl_keepalive_proc.pid)
+            atexit.register(_stop_wsl_keepalive)
+        except Exception as e:
+            logger.warning("Failed to start WSL keepalive process: %s", e)
+
+def _stop_wsl_keepalive():
+    """Stop the background WSL keepalive process cleanly on exit."""
+    global _wsl_keepalive_proc
+    if _wsl_keepalive_proc is not None:
+        try:
+            _wsl_keepalive_proc.terminate()
+            _wsl_keepalive_proc.wait(timeout=1)
+            logger.info("Stopped WSL keepalive process.")
+        except Exception:
+            try:
+                _wsl_keepalive_proc.kill()
+            except Exception:
+                pass
+        _wsl_keepalive_proc = None
+
+def _detect_redis_host() -> str:
+    """Auto-detect the best Redis host address.
+
+    On Windows with WSL2, Redis runs inside a Linux VM whose loopback
+    (127.0.0.1) is NOT the same as the Windows loopback.  We try:
+      1. The WSL2 VM's real IP (obtained via ``wsl hostname -I``).
+      2. ``localhost`` — Windows sometimes proxies this into WSL2.
+      3. ``127.0.0.1`` — works only when Redis is native on Windows.
+    """
+    import subprocess
+    # Try to get WSL2 IP
+    candidates = []
+    try:
+        result = subprocess.run(
+            ["wsl", "hostname", "-I"],
+            capture_output=True, text=True, timeout=3
+        )
+        wsl_ip = result.stdout.strip().split()[0] if result.returncode == 0 else None
+        if wsl_ip:
+            candidates.append(wsl_ip)
+    except Exception:
+        pass
+    candidates.append("127.0.0.1")
+
+    for host in candidates:
+        try:
+            with socket.create_connection((host, REDIS_PORT), timeout=2):
+                logger.info("Detected Redis reachable at %s:%s", host, REDIS_PORT)
+                return host
+        except OSError:
+            continue
+    logger.warning("Could not detect Redis host. Defaulting to 127.0.0.1.")
+    return "127.0.0.1"
+
+
+REDIS_HOST = _detect_redis_host()
+
 
 def load_dataset() -> pd.DataFrame:
     """Loads the processed features dataset (Parquet preferred, CSV fallback)."""
@@ -74,11 +152,29 @@ def connect_redis():
     """Return a Redis client if a local Redis server is reachable."""
     try:
         import redis
+        
+        # Start WSL keepalive if connecting to WSL IP
+        _start_wsl_keepalive(REDIS_HOST)
+        
+        import socket
+        socket_keepalive_options = {}
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            socket_keepalive_options[socket.TCP_KEEPIDLE] = 10
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            socket_keepalive_options[socket.TCP_KEEPINTVL] = 5
+        if hasattr(socket, "TCP_KEEPCNT"):
+            socket_keepalive_options[socket.TCP_KEEPCNT] = 3
+
         client = redis.Redis(
             host=REDIS_HOST,
             port=REDIS_PORT,
             decode_responses=True,
-            socket_connect_timeout=2
+            socket_connect_timeout=3,
+            socket_timeout=5,
+            socket_keepalive=True,
+            socket_keepalive_options=socket_keepalive_options,
+            retry_on_timeout=True,
+            health_check_interval=15,
         )
         client.ping()
         logger.info("Connected to Redis server on %s:%s. Stream playback enabled.", REDIS_HOST, REDIS_PORT)
