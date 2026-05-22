@@ -127,9 +127,11 @@ def run_worker():
                     ts = pd.to_datetime(timestamp_str)
                     event["timestamp"] = ts
 
-                    # A. Update local features dataframe for time-series context
+                    # A. Update local live features dataframe for time-series context
                     new_row = pd.DataFrame([event])
-                    hub.features_df = pd.concat([hub.features_df, new_row], ignore_index=True)
+                    common_cols = [c for c in hub.features_df.columns if c in new_row.columns]
+                    new_row = new_row[common_cols]
+                    hub.live_features_df = pd.concat([hub.live_features_df, new_row], ignore_index=True)
 
                     # B. Update topology metrics
                     hub.topology.update_volume_metrics(volume_id, event)
@@ -178,12 +180,12 @@ def run_worker():
 
                 pipe.execute()
 
-            # Prevent features_df memory leak (trim df if it exceeds 15,000 rows, keeping last 200 per volume)
+            # Prevent live_features_df memory leak (trim df if it exceeds 15,000 rows, keeping last 200 per volume)
             current_time = time.time()
-            if len(hub.features_df) > 15000 and (current_time - last_trim_time > 60):
-                hub.features_df = hub.features_df.groupby("volume_id").tail(200).reset_index(drop=True)
+            if len(hub.live_features_df) > 15000 and (current_time - last_trim_time > 60):
+                hub.live_features_df = hub.live_features_df.groupby("volume_id").tail(200).reset_index(drop=True)
                 last_trim_time = current_time
-                logger.info(f"Trimmed local features dataframe. Size: {len(hub.features_df)} rows.")
+                logger.info(f"Trimmed local live features dataframe. Size: {len(hub.live_features_df)} rows.")
 
         except Exception as e:
             logger.error(f"Error in main consumption loop: {e}")

@@ -62,6 +62,10 @@ class InferenceHub:
             self.features_df = pd.read_csv(features_pq)
 
         self.features_df["timestamp"] = pd.to_datetime(self.features_df["timestamp"])
+
+        # Live features buffer: populated by API's _append_feature_rows.
+        # Kept separate from the immutable historical snapshot.
+        self.live_features_df = pd.DataFrame(columns=self.features_df.columns)
         
         # Topology
         self.topology = TopologyGraph.from_dataframe(self.features_df)
@@ -119,17 +123,29 @@ class InferenceHub:
         self.tft.load_state_dict(torch.load(tft_path, map_location="cpu"))
         self.tft.eval()
 
+    def combined_features(self) -> pd.DataFrame:
+        """Return historical + live features merged for model queries.
+
+        Live rows take priority when the same (volume_id, timestamp) exists
+        in both frames, but in practice the timestamps are disjoint.
+        """
+        if self.live_features_df.empty:
+            return self.features_df
+        return pd.concat([self.features_df, self.live_features_df], ignore_index=True)
+
     def get_raw_feature_row(self, volume_id: str, timestamp: pd.Timestamp) -> pd.Series:
         """Extract the exact feature row at timestamp for volume_id."""
-        df_vol = self.features_df[(self.features_df["volume_id"] == volume_id) & (self.features_df["timestamp"] == timestamp)]
+        cdf = self.combined_features()
+        df_vol = cdf[(cdf["volume_id"] == volume_id) & (cdf["timestamp"] == timestamp)]
         if df_vol.empty:
-            df_vol = self.features_df[self.features_df["volume_id"] == volume_id].sort_values("timestamp")
+            df_vol = cdf[cdf["volume_id"] == volume_id].sort_values("timestamp")
             return df_vol.iloc[-1]
         return df_vol.iloc[0]
 
     def get_lstm_sequence(self, volume_id: str, timestamp: pd.Timestamp) -> np.ndarray:
         """Extract 12-step sequence of the 10 features for the volume up to timestamp."""
-        df_vol = self.features_df[(self.features_df["volume_id"] == volume_id) & (self.features_df["timestamp"] <= timestamp)]
+        cdf = self.combined_features()
+        df_vol = cdf[(cdf["volume_id"] == volume_id) & (cdf["timestamp"] <= timestamp)]
         df_vol = df_vol.sort_values("timestamp").tail(12)
         
         # Extract features
@@ -141,7 +157,8 @@ class InferenceHub:
 
     def get_nbeats_input(self, volume_id: str, timestamp: pd.Timestamp) -> np.ndarray:
         """Prepare 20 days of daily capacity history."""
-        df_vol = self.features_df[(self.features_df["volume_id"] == volume_id) & (self.features_df["timestamp"] <= timestamp)].copy()
+        cdf = self.combined_features()
+        df_vol = cdf[(cdf["volume_id"] == volume_id) & (cdf["timestamp"] <= timestamp)].copy()
         df_vol["date"] = pd.to_datetime(df_vol["timestamp"].dt.date)
         daily = df_vol.groupby("date")["capacity_used_pct"].last()
         
@@ -157,7 +174,8 @@ class InferenceHub:
 
     def get_tft_input(self, volume_id: str, timestamp: pd.Timestamp) -> np.ndarray:
         """Prepare 24 hours of hourly feature history."""
-        df_vol = self.features_df[(self.features_df["volume_id"] == volume_id) & (self.features_df["timestamp"] <= timestamp)].copy()
+        cdf = self.combined_features()
+        df_vol = cdf[(cdf["volume_id"] == volume_id) & (cdf["timestamp"] <= timestamp)].copy()
         df_vol["latency_p95_us"] = df_vol[["read_latency_p95_us", "write_latency_p95_us"]].max(axis=1)
         df_vol["hour_ts"] = pd.to_datetime(df_vol["timestamp"].dt.round("h"))
         
@@ -186,8 +204,9 @@ class InferenceHub:
     def analyze_volume(self, volume_id: str, timestamp: Optional[pd.Timestamp] = None) -> Dict[str, Any]:
         """Runs full coordinated inference for a volume at the given timestamp."""
         if timestamp is None:
-            # Use the latest timestamp in the features dataframe
-            timestamp = self.features_df[self.features_df["volume_id"] == volume_id]["timestamp"].max()
+            # Use the latest timestamp across historical + live features
+            cdf = self.combined_features()
+            timestamp = cdf[cdf["volume_id"] == volume_id]["timestamp"].max()
             
         timestamp = pd.to_datetime(timestamp)
         

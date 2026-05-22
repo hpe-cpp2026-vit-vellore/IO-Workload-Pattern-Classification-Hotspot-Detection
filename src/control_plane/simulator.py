@@ -23,7 +23,10 @@ class WhatIfSimulator:
     def __init__(self, hub: InferenceHub) -> None:
         self.hub = hub
         self.topology = hub.topology
-        self.features_df = hub.features_df
+
+    @property
+    def features_df(self) -> pd.DataFrame:
+        return self.hub.combined_features()
 
     def simulate_add_capacity_scenario(self, volume_id: str, added_gb: float) -> Dict[str, Any]:
         """Simulate adding storage capacity and compute new Days-to-Fill (DTF)."""

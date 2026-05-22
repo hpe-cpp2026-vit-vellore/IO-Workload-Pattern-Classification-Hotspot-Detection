@@ -105,6 +105,8 @@ class LiveTelemetryState:
         self.history_by_volume: Dict[str, deque] = {}
         self.events_received = 0
         self.current_tick: Optional[pd.Timestamp] = None
+        self.latest_complete_tick: Optional[pd.Timestamp] = None
+        self._expected_volume_count: Optional[int] = None
         self.first_received_at: Optional[pd.Timestamp] = None
         self.last_received_at: Optional[pd.Timestamp] = None
 
@@ -128,11 +130,24 @@ class LiveTelemetryState:
         self.events_received += 1
         self.current_tick = copied["timestamp"]
 
+        # Track latest complete tick (all expected volumes have reported for this timestamp)
+        if self._expected_volume_count is not None:
+            tick_count = sum(
+                1 for row in self.latest_by_volume.values()
+                if row.get("timestamp") == self.current_tick
+            )
+            if tick_count >= self._expected_volume_count:
+                self.latest_complete_tick = self.current_tick
+
         now = pd.Timestamp.now()
         if self.first_received_at is None:
             self.first_received_at = now
         self.last_received_at = now
         return copied
+
+    def set_expected_volume_count(self, count: int) -> None:
+        """Set the number of volumes expected per tick (e.g. 50)."""
+        self._expected_volume_count = count
 
     def latest_rows(self) -> List[Dict[str, Any]]:
         return list(self.latest_by_volume.values())
@@ -159,6 +174,7 @@ class LiveTelemetryState:
             "live_volume_count": len(self.latest_by_volume),
             "expected_volume_count": expected_volume_count,
             "current_tick": self.current_tick.isoformat() if self.current_tick is not None else None,
+            "latest_complete_tick": self.latest_complete_tick.isoformat() if self.latest_complete_tick is not None else None,
             "current_tick_volume_count": current_tick_volume_count,
             "current_tick_complete": (
                 current_tick_volume_count >= expected_volume_count
@@ -319,10 +335,37 @@ async def redis_stream_listener():
         except Exception as e:
             logger.error(f"Error in redis_stream_listener: {e}")
             await asyncio.sleep(2)
+MAX_ROWS_PER_VOLUME = 500  # model inference context window per volume
 
 def _append_feature_rows(rows: List[Dict[str, Any]]) -> None:
-    """Deprecated compatibility hook: live rows now stay out of hub.features_df."""
-    return
+    """Append live telemetry rows to hub.live_features_df for ML model inference.
+
+    The historical hub.features_df remains immutable (Parquet snapshot).
+    InferenceHub data-access methods search live_features_df first,
+    then fall back to features_df.
+    """
+    if hub is None or not rows:
+        return
+    try:
+        new_df = pd.DataFrame(rows)
+        if "timestamp" in new_df.columns:
+            new_df["timestamp"] = pd.to_datetime(new_df["timestamp"])
+        # Only keep columns that exist in the original features dataframe
+        common_cols = [c for c in hub.features_df.columns if c in new_df.columns]
+        new_df = new_df[common_cols]
+        hub.live_features_df = pd.concat([hub.live_features_df, new_df], ignore_index=True)
+
+        # Periodic trim: keep only the last MAX_ROWS_PER_VOLUME rows per volume
+        if len(hub.live_features_df) > MAX_ROWS_PER_VOLUME * 60:
+            hub.live_features_df = (
+                hub.live_features_df
+                .sort_values("timestamp")
+                .groupby("volume_id", group_keys=False)
+                .tail(MAX_ROWS_PER_VOLUME)
+                .reset_index(drop=True)
+            )
+    except Exception as e:
+        logger.error("_append_feature_rows failed: %s", e)
 
 async def _analyze_and_cache_volume(volume_id: str, ts: pd.Timestamp) -> None:
     """Run heavier per-volume inference outside the ingestion hot path."""
@@ -477,6 +520,11 @@ async def startup_event():
     
     # Initialize SHAP explainer
     explainer = shap.TreeExplainer(hub.classifier)
+
+    # Wire expected volume count for complete-tick tracking
+    expected_count = get_expected_volume_count()
+    if expected_count:
+        live_state.set_expected_volume_count(expected_count)
     
     # Try to connect to Redis. If unavailable, the API owns a direct TCP fallback.
     redis_error = None
@@ -591,14 +639,35 @@ def get_kpi():
             "rollback_rate_pct": 0.0,
             "classifier_accuracy_target_pct": 95.0,
             "latency_variance_reduction_target_pct": 30.0,
+            "is_live": False,
+            "source": "not_ready",
+            "current_tick": None,
+            "live_volume_count": 0,
         }
-    
-    latest_ts = hub.features_df["timestamp"].max()
-    latest_rows = hub.features_df[hub.features_df["timestamp"] == latest_ts]
-    
-    avg_latency = float(latest_rows["avg_latency_us"].mean()) if not latest_rows.empty else 0.0
-    total_iops = float(latest_rows["total_iops"].sum()) if not latest_rows.empty else 0.0
-    
+
+    # Determine whether live telemetry is available
+    is_live = live_state.events_received > 0
+
+    if is_live:
+        # Use the latest received event per volume for pool-wide KPIs
+        latest_rows = live_state.latest_rows()
+        latencies = [float(row.get("avg_latency_us", 0.0) or 0.0) for row in latest_rows]
+        iops_vals = [float(row.get("total_iops", 0.0) or 0.0) for row in latest_rows]
+        avg_latency = float(np.mean(latencies)) if latencies else 0.0
+        total_iops = float(np.sum(iops_vals)) if iops_vals else 0.0
+        current_tick = live_state.current_tick.isoformat() if live_state.current_tick is not None else None
+        source = "live_telemetry"
+        live_volume_count = len(latest_rows)
+    else:
+        # Fallback: use the static Parquet dataset's final timestamp
+        latest_ts = hub.features_df["timestamp"].max()
+        latest_df = hub.features_df[hub.features_df["timestamp"] == latest_ts]
+        avg_latency = float(latest_df["avg_latency_us"].mean()) if not latest_df.empty else 0.0
+        total_iops = float(latest_df["total_iops"].sum()) if not latest_df.empty else 0.0
+        current_tick = latest_ts.isoformat() if latest_ts is not None else None
+        source = "historical_parquet"
+        live_volume_count = 0
+
     mon_summary = {
         "total_actions": 0,
         "rolled_back_count": 0,
@@ -606,7 +675,7 @@ def get_kpi():
     }
     if monitor is not None:
         mon_summary = monitor.get_summary()
-    
+
     return {
         "avg_latency_us": round(avg_latency, 2),
         "total_iops": round(total_iops, 2),
@@ -615,6 +684,13 @@ def get_kpi():
         "rollback_rate_pct": mon_summary["rollback_rate_pct"],
         "classifier_accuracy_target_pct": 95.0,
         "latency_variance_reduction_target_pct": 30.0,
+        "is_live": is_live,
+        "source": source,
+        "current_tick": current_tick,
+        "live_volume_count": live_volume_count,
+        "events_received": live_state.events_received,
+        "stream_started_at": live_state.first_received_at.isoformat() if live_state.first_received_at is not None else None,
+        "latest_complete_tick": live_state.latest_complete_tick.isoformat() if live_state.latest_complete_tick is not None else None,
     }
 
 
@@ -627,14 +703,39 @@ def get_volumes():
         tier = "HDD"
         if hub.topology.graph.has_node(vol_id):
             tier = hub.topology.graph.nodes[vol_id].get("tier", "HDD")
-            
+
+        # Enrich with live telemetry when available
+        live_event = live_state.latest_by_volume.get(vol_id)
+        if live_event is not None:
+            current_iops = float(live_event.get("total_iops", 0.0) or 0.0)
+            current_latency = float(live_event.get("avg_latency_us", 0.0) or 0.0)
+            last_seen_ts = live_event.get("timestamp")
+            last_seen = last_seen_ts.isoformat() if isinstance(last_seen_ts, pd.Timestamp) else str(last_seen_ts)
+            vol_is_live = True
+        else:
+            current_iops = 0.0
+            current_latency = 0.0
+            last_seen = analysis.get("timestamp")
+            vol_is_live = False
+
+        # Include analysis freshness so dashboard can judge hotspot score age
+        analysis_ts = analysis.get("timestamp")
+        last_analyzed = last_analyzed_time.get(vol_id, 0.0)
+        analysis_age_s = round(time.time() - last_analyzed, 1) if last_analyzed > 0 else None
+
         result.append({
             "volume_id": vol_id,
             "hotspot_score": analysis["hotspot_score"],
             "workload_type": analysis["workload_type"],
             "tier": tier,
-            "capacity_used_pct": analysis["days_to_fill"].get("capacity_used_pct", 50.0), # estimated
-            "latency_risk_score": analysis["latency_risk_score"]
+            "capacity_used_pct": analysis["days_to_fill"].get("capacity_used_pct", 50.0),
+            "latency_risk_score": analysis["latency_risk_score"],
+            "current_iops": round(current_iops, 2),
+            "current_latency_us": round(current_latency, 2),
+            "last_seen_timestamp": last_seen,
+            "is_live": vol_is_live,
+            "last_analyzed_timestamp": analysis_ts,
+            "analysis_freshness_s": analysis_age_s,
         })
     return result
 
@@ -643,48 +744,46 @@ def get_volumes():
 def get_volume_metrics(id: str, limit: int = Query(100, ge=1, le=500)):
     """Retrieve historical time-series telemetry data for a volume."""
     validate_volume(id)
-    
+
+    def _format_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalise a single telemetry row into the API response schema."""
+        ts = row.get("timestamp")
+        if isinstance(ts, pd.Timestamp):
+            ts = ts.isoformat()
+        return {
+            "timestamp": str(ts),
+            "read_iops": float(row.get("read_iops", 0.0) or 0.0),
+            "write_iops": float(row.get("write_iops", 0.0) or 0.0),
+            "total_iops": float(row.get("total_iops", 0.0) or 0.0),
+            "read_throughput_mbps": float(row.get("read_throughput_mbps", 0.0) or 0.0),
+            "write_throughput_mbps": float(row.get("write_throughput_mbps", 0.0) or 0.0),
+            "avg_latency_us": float(row.get("avg_latency_us", 0.0) or 0.0),
+            "read_latency_p95_us": float(row.get("read_latency_p95_us", 0.0) or 0.0),
+            "write_latency_p95_us": float(row.get("write_latency_p95_us", 0.0) or 0.0),
+            "queue_depth": float(row.get("queue_depth", 0.0) or 0.0),
+            "capacity_used_pct": float(row.get("capacity_used_pct", 0.0) or 0.0),
+        }
+
+    # Priority 1: Redis history (when Redis is the active bus)
     if use_redis and r is not None:
         try:
             raw_items = r.lrange(f"volume:{id}:history", 0, limit - 1)
-            records = []
-            for item in raw_items:
-                event = json.loads(item)
-                records.append({
-                    "timestamp": event.get("timestamp"),
-                    "read_iops": float(event.get("read_iops", 0.0)),
-                    "write_iops": float(event.get("write_iops", 0.0)),
-                    "total_iops": float(event.get("total_iops", 0.0)),
-                    "read_throughput_mbps": float(event.get("read_throughput_mbps", 0.0)),
-                    "write_throughput_mbps": float(event.get("write_throughput_mbps", 0.0)),
-                    "avg_latency_us": float(event.get("avg_latency_us", 0.0)),
-                    "read_latency_p95_us": float(event.get("read_latency_p95_us", 0.0)),
-                    "write_latency_p95_us": float(event.get("write_latency_p95_us", 0.0)),
-                    "queue_depth": float(event.get("queue_depth", 0.0)),
-                    "capacity_used_pct": float(event.get("capacity_used_pct", 0.0))
-                })
+            records = [_format_row(json.loads(item)) for item in raw_items]
             records.reverse()
             return records
         except Exception as e:
             logger.error(f"Error reading metrics for {id} from Redis: {e}")
-            
+
+    # Priority 2: Live telemetry history (TCP fallback mode)
+    live_history = live_state.history(id, limit)
+    if live_history:
+        return [_format_row(row) for row in live_history]
+
+    # Priority 3: Static Parquet history (before playback starts)
     df_vol = hub.features_df[hub.features_df["volume_id"] == id].sort_values("timestamp").tail(limit)
-    
     records = []
     for _, row in df_vol.iterrows():
-        records.append({
-            "timestamp": row["timestamp"].isoformat() if isinstance(row["timestamp"], pd.Timestamp) else str(row["timestamp"]),
-            "read_iops": float(row["read_iops"]),
-            "write_iops": float(row["write_iops"]),
-            "total_iops": float(row["total_iops"]),
-            "read_throughput_mbps": float(row["read_throughput_mbps"]),
-            "write_throughput_mbps": float(row["write_throughput_mbps"]),
-            "avg_latency_us": float(row["avg_latency_us"]),
-            "read_latency_p95_us": float(row["read_latency_p95_us"]),
-            "write_latency_p95_us": float(row["write_latency_p95_us"]),
-            "queue_depth": float(row["queue_depth"]),
-            "capacity_used_pct": float(row.get("capacity_used_pct", 0.0))
-        })
+        records.append(_format_row(row.to_dict()))
     return records
 
 
@@ -734,7 +833,12 @@ def get_volume_explanation(id: str):
     validate_volume(id)
     
     # Run SHAP on classifier
-    row = hub.get_raw_feature_row(id, pd.to_datetime(hub.features_df["timestamp"].max()))
+    # Use live tick when playback is active, otherwise fall back to latest in features_df
+    if live_state.current_tick is not None:
+        explain_ts = live_state.current_tick
+    else:
+        explain_ts = hub.features_df["timestamp"].max()
+    row = hub.get_raw_feature_row(id, pd.to_datetime(explain_ts))
     
     classifier_feature_cols = hub.classifier_scaler.feature_names_in_.tolist()
     features_vec = row[classifier_feature_cols].values.astype(np.float64).reshape(1, -1)
@@ -789,15 +893,23 @@ def get_alerts():
                 severity = "High"
             elif score >= 80:
                 severity = "Critical"
-                
+
+            # Prefer live timestamp when available
+            live_event = live_state.latest_by_volume.get(vol_id)
+            if live_event is not None:
+                ts = live_event.get("timestamp")
+                alert_ts = ts.isoformat() if isinstance(ts, pd.Timestamp) else str(ts)
+            else:
+                alert_ts = analysis["timestamp"]
+
             alerts.append({
                 "volume_id": vol_id,
                 "hotspot_score": score,
                 "severity": severity,
                 "workload_type": analysis["workload_type"],
-                "timestamp": analysis["timestamp"]
+                "timestamp": alert_ts,
             })
-            
+
     # Sort alerts by score descending
     alerts = sorted(alerts, key=lambda x: x["hotspot_score"], reverse=True)
     return alerts

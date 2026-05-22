@@ -304,13 +304,61 @@ if selected_page == "Live Overview":
     volumes_list = get_api_data("/volumes") or []
     alerts = get_api_data("/alerts") or []
     
+    # ── Live telemetry status bar ──
+    is_live = kpi_data.get("is_live", False)
+    source = kpi_data.get("source", "unknown")
+    current_tick = kpi_data.get("current_tick")
+    live_vol_count = kpi_data.get("live_volume_count", 0)
+    
+    if is_live:
+        tick_display = current_tick if current_tick else "—"
+        events_count = kpi_data.get("events_received", 0)
+        st.markdown(f"""
+        <div style="
+            background: rgba(0, 230, 118, 0.08);
+            border: 1px solid rgba(0, 230, 118, 0.25);
+            border-radius: 10px;
+            padding: 10px 18px;
+            margin-bottom: 18px;
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            font-size: 13px;
+        ">
+            <span style="color: #00e676; font-weight: 700;">● LIVE</span>
+            <span style="color: #c9d1d9;">Simulated Tick: <strong style="color:#00f0ff;">{tick_display}</strong></span>
+            <span style="color: #8b949e;">Source: {source}</span>
+            <span style="color: #8b949e;">Volumes: <strong style="color:#ffffff;">{live_vol_count}</strong></span>
+            <span style="color: #8b949e;">Events: <strong style="color:#ffffff;">{events_count:,}</strong></span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div style="
+            background: rgba(255, 145, 0, 0.06);
+            border: 1px solid rgba(255, 145, 0, 0.2);
+            border-radius: 10px;
+            padding: 10px 18px;
+            margin-bottom: 18px;
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            font-size: 13px;
+        ">
+            <span style="color: #ff9100; font-weight: 700;">◉ HISTORICAL</span>
+            <span style="color: #c9d1d9;">Showing static Parquet snapshot — start <code>telemetry_playback.py</code> for live data</span>
+            <span style="color: #8b949e;">Source: {source}</span>
+        </div>
+        """, unsafe_allow_html=True)
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         avg_lat = kpi_data.get("avg_latency_us", 0.0)
+        lat_color = "#ff1744" if avg_lat > 1500 else "#00f0ff"
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-title">Average Latency</div>
-            <div class="metric-value">{avg_lat:.1f} <span style="font-size:16px;">µs</span></div>
+            <div class="metric-value" style="color:{lat_color};">{avg_lat:.1f} <span style="font-size:16px;">µs</span></div>
             <div class="metric-subtitle">SLO target < 1500 µs</div>
         </div>
         """, unsafe_allow_html=True)
@@ -341,6 +389,11 @@ if selected_page == "Live Overview":
             <div class="metric-subtitle">SLO target < 1.0%</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # ── Auto-refresh: re-run every 3 seconds so live KPIs update ──
+    if is_live:
+        time.sleep(3)
+        st.rerun()
         
     mcol1, mcol2 = st.columns([2, 1])
     
@@ -434,6 +487,38 @@ elif selected_page == "Volume Deep Dive":
     
     selected_vol = st.selectbox("Select Target Volume for Diagnostic Extraction:", vol_ids)
     
+    # Extract the selected volume's live enrichment
+    vol_row = vols_df[vols_df["volume_id"] == selected_vol].iloc[0]
+    vol_is_live = bool(vol_row.get("is_live", False))
+    vol_current_iops = float(vol_row.get("current_iops", 0.0))
+    vol_current_latency = float(vol_row.get("current_latency_us", 0.0))
+    vol_last_seen = vol_row.get("last_seen_timestamp", "—")
+    
+    # Show live/historical badge for the selected volume
+    if vol_is_live:
+        st.markdown(f"""
+        <div style="
+            background: rgba(0, 230, 118, 0.08); border: 1px solid rgba(0, 230, 118, 0.25);
+            border-radius: 8px; padding: 8px 14px; margin-bottom: 14px;
+            display: flex; align-items: center; gap: 18px; font-size: 12px;
+        ">
+            <span style="color: #00e676; font-weight: 700;">● LIVE</span>
+            <span style="color: #c9d1d9;">Last telemetry: <strong style="color:#00f0ff;">{vol_last_seen}</strong></span>
+            <span style="color: #8b949e;">Live IOPS: <strong>{int(vol_current_iops):,}</strong></span>
+            <span style="color: #8b949e;">Live Latency: <strong>{vol_current_latency:.1f} µs</strong></span>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style="
+            background: rgba(255, 145, 0, 0.06); border: 1px solid rgba(255, 145, 0, 0.2);
+            border-radius: 8px; padding: 8px 14px; margin-bottom: 14px;
+            font-size: 12px; color: #ff9100;
+        ">
+            ◉ HISTORICAL — Metrics from static Parquet dataset. Start telemetry_playback.py for live data.
+        </div>
+        """, unsafe_allow_html=True)
+    
     # Retrieve metrics
     metrics = get_api_data(f"/volumes/{selected_vol}/metrics", params={"limit": 60})
     workload = get_api_data(f"/volumes/{selected_vol}/workload")
@@ -451,7 +536,7 @@ elif selected_page == "Volume Deep Dive":
     
     with dcol1:
         # Hotspot score gauge
-        curr_score = float(vols_df[vols_df["volume_id"] == selected_vol]["hotspot_score"].values[0])
+        curr_score = float(vol_row["hotspot_score"])
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge+number",
             value=curr_score,
@@ -488,15 +573,18 @@ elif selected_page == "Volume Deep Dive":
             st.plotly_chart(fig_conf, use_container_width=True)
             
     with dcol3:
-        # Diagnostics details
+        # Diagnostics details — use live metrics when available
+        display_iops = int(vol_current_iops) if vol_is_live else int(df_metrics['total_iops'].iloc[-1])
+        display_latency = vol_current_latency if vol_is_live else float(df_metrics['avg_latency_us'].iloc[-1])
+        data_label = "Live" if vol_is_live else "Historical"
         st.markdown(f"""
         <div class="metric-card" style="height: 250px;">
             <div class="metric-title">Volume Metadata & Details</div>
             <p><strong>Volume ID:</strong> {selected_vol}</p>
-            <p><strong>Predicted Classification:</strong> <span style="color:#00f0ff; font-weight:bold;">{workload.get('workload_type')}</span></p>
-            <p><strong>Active Tier:</strong> {vols_df[vols_df['volume_id'] == selected_vol]['tier'].values[0]}</p>
-            <p><strong>Current IOPS:</strong> {int(df_metrics['total_iops'].iloc[-1]):,}</p>
-            <p><strong>Mean Latency:</strong> {df_metrics['avg_latency_us'].iloc[-1]:.1f} µs</p>
+            <p><strong>Predicted Classification:</strong> <span style="color:#00f0ff; font-weight:bold;">{workload.get('workload_type') if workload else '—'}</span></p>
+            <p><strong>Active Tier:</strong> {vol_row['tier']}</p>
+            <p><strong>Current IOPS ({data_label}):</strong> {display_iops:,}</p>
+            <p><strong>Mean Latency ({data_label}):</strong> {display_latency:.1f} µs</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -522,8 +610,9 @@ elif selected_page == "Volume Deep Dive":
         fig_shap.update_layout(height=350)
         st.plotly_chart(fig_shap, use_container_width=True)
         
-    # Historical Latency chart (p50, p95, p99 lines)
-    st.subheader("📈 Historical Latency Distribution (Last 60 ticks)")
+    # Latency chart
+    chart_source = "Live Telemetry" if vol_is_live else "Historical Parquet"
+    st.subheader(f"📈 Latency Distribution — Last {len(df_metrics)} ticks ({chart_source})")
     fig_lat = go.Figure()
     fig_lat.add_trace(go.Scatter(x=df_metrics["timestamp"], y=df_metrics["avg_latency_us"], name="Average Latency (p50)", line=dict(color="#00e676", width=2)))
     fig_lat.add_trace(go.Scatter(x=df_metrics["timestamp"], y=df_metrics["read_latency_p95_us"], name="Read Tail Latency (p95)", line=dict(color="#ff9100", width=1.5, dash='dash')))
@@ -532,6 +621,11 @@ elif selected_page == "Volume Deep Dive":
     apply_dark_theme(fig_lat)
     fig_lat.update_layout(height=350, yaxis_title="Latency (µs)")
     st.plotly_chart(fig_lat, use_container_width=True)
+    
+    # Auto-refresh when live telemetry is flowing
+    if vol_is_live:
+        time.sleep(5)
+        st.rerun()
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -600,7 +694,11 @@ elif selected_page == "Hotspot & Noisy Neighbors":
     st.markdown("Visualizing shared storage nodes and identifying aggressor volumes causing target latency spikes.", unsafe_allow_html=True)
     
     topo_data = get_api_data("/topology") or {}
+    volumes_list = get_api_data("/volumes") or []
     noisy_pairs = get_api_data("/noisy-neighbors") or []
+    
+    # Build a lookup for live metrics per volume
+    vol_lookup: Dict[str, dict] = {v["volume_id"]: v for v in volumes_list} if volumes_list else {}
     
     col_g, col_n = st.columns([2, 1])
     
@@ -642,13 +740,57 @@ elif selected_page == "Hotspot & Noisy Neighbors":
                 
                 meta = node_map[node]
                 if meta["type"] == "storage_node":
-                    node_colors.append("#7b2cbf") # Indigo
+                    # Aggregate live metrics for child volumes of this node
+                    child_volumes = [v for v in G.neighbors(node) if v.startswith("vol_")]
+                    child_iops = sum(
+                        vol_lookup.get(v, {}).get("current_iops", 0.0)
+                        for v in child_volumes
+                    )
+                    child_latencies = [
+                        float(vol_lookup.get(v, {}).get("current_latency_us", 0.0))
+                        for v in child_volumes
+                        if vol_lookup.get(v, {}).get("current_latency_us", 0.0)
+                    ]
+                    avg_lat = float(np.mean(child_latencies)) if child_latencies else 0.0
+                    hotspot_count = sum(
+                        1 for v in child_volumes
+                        if float(vol_lookup.get(v, {}).get("hotspot_score", 0.0)) >= 40
+                    )
+                    node_colors.append("#7b2cbf")
                     node_sizes.append(25)
-                    hover_text.append(f"Storage Node: {node}<br>Tier: {meta.get('tier')}")
+                    hover_text.append(
+                        f"Storage Node: {node}<br>Tier: {meta.get('tier')}"
+                        f"<br>Aggregate IOPS: {int(child_iops):,}"
+                        f"<br>Avg Latency: {avg_lat:.1f} µs"
+                        f"<br>Hotspot Volumes: {hotspot_count}/{len(child_volumes)}"
+                    )
                 else:
-                    node_colors.append("#00f0ff") # Cyan
-                    node_sizes.append(12)
-                    hover_text.append(f"Volume: {node}<br>Tier: {meta.get('tier')}")
+                    # Color volume nodes by hotspot severity
+                    vinfo = vol_lookup.get(node, {})
+                    hs = float(vinfo.get("hotspot_score", 0.0))
+                    v_iops = float(vinfo.get("current_iops", 0.0))
+                    v_lat = float(vinfo.get("current_latency_us", 0.0))
+                    v_live = vinfo.get("is_live", False)
+                    
+                    if hs >= 80:
+                        color = "#ff1744"  # Critical — red
+                    elif hs >= 60:
+                        color = "#ff9100"  # High — orange
+                    elif hs >= 40:
+                        color = "#ffd600"  # Warning — yellow
+                    else:
+                        color = "#00e676"  # Healthy — green
+                    
+                    node_colors.append(color)
+                    node_sizes.append(14)
+                    live_tag = "● Live" if v_live else "◉ Historical"
+                    hover_text.append(
+                        f"Volume: {node}<br>Tier: {meta.get('tier')}"
+                        f"<br>Hotspot: {hs:.1f}"
+                        f"<br>IOPS: {int(v_iops):,}"
+                        f"<br>Latency: {v_lat:.1f} µs"
+                        f"<br>{live_tag}"
+                    )
                     
             fig = go.Figure()
             fig.add_trace(go.Scatter(
