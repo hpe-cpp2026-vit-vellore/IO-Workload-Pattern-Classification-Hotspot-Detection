@@ -151,7 +151,7 @@ class NoisyNeighborDetector:
                 raise ValueError(f"features missing required column: {col}")
 
         # Named agg avoids fragile MultiIndex column-order assignment.
-        stats = features.groupby("volume_id").agg(
+        stats = features.groupby("volume_id", observed=False).agg(
             lat_mean=(self.LATENCY_COL, "mean"),
             lat_std =(self.LATENCY_COL, "std"),
             lat_n   =(self.LATENCY_COL, "count"),

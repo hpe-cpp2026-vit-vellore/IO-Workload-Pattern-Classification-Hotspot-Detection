@@ -214,13 +214,15 @@ class InferenceHub:
         row = self.get_raw_feature_row(volume_id, timestamp)
         
         classifier_feature_cols = self.classifier_scaler.feature_names_in_.tolist()
-        features_vec = row[classifier_feature_cols].values.astype(np.float64).reshape(1, -1)
-        features_log = np.sign(features_vec) * np.log1p(np.abs(features_vec))
-        features_scaled = self.classifier_scaler.transform(features_log)
+        features_arr = row[classifier_feature_cols].to_numpy(dtype=np.float64).reshape(1, -1)
+        features_log = np.sign(features_arr) * np.log1p(np.abs(features_arr))
+        features_log_df = pd.DataFrame(features_log, columns=classifier_feature_cols)
+        features_scaled = self.classifier_scaler.transform(features_log_df)
+        features_scaled_df = pd.DataFrame(features_scaled, columns=classifier_feature_cols)
         
         # Predict workload
-        pred_class = int(self.classifier.predict(features_scaled)[0])
-        pred_probs = self.classifier.predict_proba(features_scaled)[0].tolist()
+        pred_class = int(self.classifier.predict(features_scaled_df)[0])
+        pred_probs = self.classifier.predict_proba(features_scaled_df)[0].tolist()
         workload_type = LABEL_NAMES[pred_class]
         
         # 2. Ensemble Anomaly Score

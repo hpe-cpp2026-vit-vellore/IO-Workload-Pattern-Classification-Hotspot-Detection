@@ -70,7 +70,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, TensorDataset
 
 logger = logging.getLogger(__name__)
@@ -283,7 +283,10 @@ class LSTMAutoencoder:
         # ── AMP scaler ────────────────────────────────────────────────────────
         # FIX (Opt-A): halves VRAM usage; 1.5-3x throughput on modern GPUs
         self._use_amp = use_amp and self.device.type == "cuda"
-        self._grad_scaler = GradScaler(enabled=self._use_amp)
+        try:
+            self._grad_scaler = GradScaler(device_type=self.device.type, enabled=self._use_amp)
+        except TypeError:
+            self._grad_scaler = GradScaler(enabled=self._use_amp)
 
         # ── Preprocessing + state ────────────────────────────────────────────
         self.scaler = StandardScaler()
@@ -460,7 +463,7 @@ class LSTMAutoencoder:
                 optimizer.zero_grad(set_to_none=True)   # faster than zero_grad()
 
                 # FIX (Opt-A): AMP forward + loss
-                with autocast(enabled=self._use_amp):
+                with autocast(device_type=self.device.type, enabled=self._use_amp):
                     reconstruction = self.model(batch_x)
                     loss = criterion(reconstruction, batch_y)
 
@@ -480,7 +483,7 @@ class LSTMAutoencoder:
             # ── Validation pass ───────────────────────────────────────────────
             self.model.eval()
             with torch.inference_mode():
-                with autocast(enabled=self._use_amp):
+                with autocast(device_type=self.device.type, enabled=self._use_amp):
                     val_recon = self.model(val_gpu)
                     val_loss = criterion(val_recon, val_gpu).item()
             self.val_losses.append(val_loss)
@@ -516,7 +519,7 @@ class LSTMAutoencoder:
         # ── Calibrate anomaly threshold from val reconstruction errors ────────
         self.model.eval()
         with torch.inference_mode():
-            with autocast(enabled=self._use_amp):
+            with autocast(device_type=self.device.type, enabled=self._use_amp):
                 val_recon = self.model(val_gpu)
             # Compute MSE per sequence: (B, T, F) → scalar per B
             val_errors = (val_gpu - val_recon).float().pow(2).mean(dim=(1, 2))
@@ -571,7 +574,7 @@ class LSTMAutoencoder:
 
         self.model.eval()
         with torch.inference_mode():
-            with autocast(enabled=self._use_amp):
+            with autocast(device_type=self.device.type, enabled=self._use_amp):
                 reconstruction = self.model(seq_tensor)
             error = float((seq_tensor - reconstruction).float().pow(2).mean())
 
@@ -630,7 +633,7 @@ class LSTMAutoencoder:
         with torch.inference_mode():
             for i in range(0, n_seq, batch_size):
                 batch = self._to_gpu(seq_tensor[i : i + batch_size])
-                with autocast(enabled=self._use_amp):
+                with autocast(device_type=self.device.type, enabled=self._use_amp):
                     reconstruction = self.model(batch)
                 batch_errors = (batch - reconstruction).float().pow(2).mean(dim=(1, 2))
                 all_errors.append(batch_errors.cpu().numpy())
