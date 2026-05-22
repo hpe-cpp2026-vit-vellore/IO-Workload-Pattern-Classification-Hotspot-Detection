@@ -47,6 +47,8 @@ class DecisionEngine:
         self.hotspot_start_times: Dict[str, pd.Timestamp] = {}
         self.action_history: List[Dict[str, Any]] = []
         self.action_queue: List[Dict[str, Any]] = []
+        # Autoscale guard
+        self.last_autoscale_time: Optional[pd.Timestamp] = None
 
     def simulate_actions(self, volume_id: str, inference_results: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Simulate migrate, QoS, and tier-change to calculate expected improvement."""
@@ -60,7 +62,11 @@ class DecisionEngine:
             target_util = topology.get_node_utilization(target_node)
             # Improvement is proportional to the IOPS imbalance reduction
             migrate_improvement = max(0.0, source_util["total_iops"] - target_util["total_iops"])
-            migrate_safe = True
+            # Validate placement against replica/anti-affinity constraints
+            try:
+                migrate_safe = topology.validate_migration(volume_id, target_node)
+            except Exception:
+                migrate_safe = False
         else:
             migrate_improvement = 0.0
             migrate_safe = False
@@ -99,14 +105,17 @@ class DecisionEngine:
             }
         ]
 
-    def evaluate_volume(self, volume_id: str, timestamp: pd.Timestamp) -> Optional[Dict[str, Any]]:
+    def evaluate_volume(self, volume_id: str, timestamp: pd.Timestamp, inference_results: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Evaluate a single volume's metrics and decide if any action is triggered."""
         if not self.enabled:
             logger.info("Decision engine disabled.")
             return None
 
         # 1. Perform model inference
-        res = self.hub.analyze_volume(volume_id, timestamp)
+        if inference_results is None:
+            res = self.hub.analyze_volume(volume_id, timestamp)
+        else:
+            res = inference_results
         hotspot_score = res["hotspot_score"]
         
         # Get current pre-action latency for registration
@@ -242,11 +251,21 @@ class DecisionEngine:
 
         return exec_record
 
-    def process_queued_actions(self, timestamp: pd.Timestamp) -> List[Dict[str, Any]]:
-        """Try to execute deferred migration actions in the queue."""
-        executed = []
+    def process_queued_actions(self, timestamp: pd.Timestamp) -> Dict[str, List[Dict[str, Any]]]:
+        """Try to execute deferred migration actions in the queue.
+
+        Returns a dict with executed migration actions and autoscale events.
+        """
+        # Check autoscale triggers first (may add nodes/pools to topology)
+        autoscale_actions: List[Dict[str, Any]] = []
+        try:
+            autoscale_actions = self._check_and_trigger_autoscale(timestamp)
+        except Exception:
+            logger.exception("Autoscale trigger failed")
+
+        executed: List[Dict[str, Any]] = []
         if not self.action_queue:
-            return executed
+            return {"migrations": executed, "autoscale": autoscale_actions}
 
         # Filter active migrations
         active_migrations = sum(
@@ -301,4 +320,114 @@ class DecisionEngine:
                 still_queued.append(task)
 
         self.action_queue = still_queued
-        return executed
+        return {"migrations": executed, "autoscale": autoscale_actions}
+
+    def _check_and_trigger_autoscale(self, timestamp: pd.Timestamp) -> List[Dict[str, Any]]:
+        """Scan forecasts (DTF) and cluster thresholds to trigger autoscaling actions.
+
+        Simple heuristic implemented here:
+          - If any volume forecasts indicate `warning_85pct_days` <= policy threshold,
+            create one new virtual node and tag it for the volume's pool.
+        This is intentionally conservative for a prototype.
+        """
+        autos = self.rebalance_policy.get("autoscale", {})
+        if not autos.get("enabled", True):
+            return []
+
+        min_interval_hours = autos.get("min_interval_hours", 24)
+        if self.last_autoscale_time is not None:
+            if (timestamp - self.last_autoscale_time).total_seconds() < min_interval_hours * 3600:
+                logger.debug("Autoscale skipped: min interval not passed.")
+                return []
+
+        max_new = autos.get("max_new_nodes_per_run", 1)
+        created: List[Dict[str, Any]] = []
+
+        def _create_autoscale_node(pool_id: str, reason: str, source_volume: Optional[str]) -> Optional[Dict[str, Any]]:
+            new_node_id = f"autoscale-{uuid.uuid4().hex[:8]}"
+            try:
+                add_res = self.rebalancer.add_virtual_node(
+                    new_node_id,
+                    capacity_gb=autos.get("new_node_capacity_gb"),
+                    tier=None,
+                    topology=self.hub.topology
+                )
+                expand_res = self.rebalancer.expand_logical_pool(pool_id, new_node_id, self.hub.topology)
+            except Exception:
+                logger.exception("Failed to perform autoscale actions for volume %s", source_volume)
+                return None
+
+            action_id = str(uuid.uuid4())
+            record = {
+                "action_id": action_id,
+                "action": "autoscale_add_node",
+                "node_id": new_node_id,
+                "pool_id": pool_id,
+                "reason": reason,
+                "volume_id": source_volume,
+                "timestamp": timestamp,
+                "status": "executed",
+                "add_res": add_res,
+                "expand_res": expand_res
+            }
+            self.action_history.append(record)
+            if self.monitor is not None:
+                self.monitor.register_event(
+                    action_id=action_id,
+                    action_state={
+                        "action": "autoscale_add_node",
+                        "node_id": new_node_id,
+                        "pool_id": pool_id,
+                        "reason": reason,
+                        "volume_id": source_volume
+                    },
+                    timestamp=timestamp,
+                    status="success"
+                )
+            created.append(record)
+            return record
+
+        # Cluster-level threshold trigger
+        cluster_threshold = autos.get("cluster_capacity_threshold_pct")
+        cluster_pool = None
+        cluster_volume = None
+        if cluster_threshold is not None:
+            samples = []
+            for vol_id, metrics in self.hub.topology._volume_metrics.items():
+                cap = metrics.get("capacity_used_pct")
+                if cap is None:
+                    continue
+                try:
+                    cap_val = float(cap)
+                except (ValueError, TypeError):
+                    continue
+                if cap_val <= 1.0:
+                    cap_val *= 100.0
+                samples.append((vol_id, cap_val))
+
+            if samples:
+                avg_capacity = sum(v for _, v in samples) / len(samples)
+                if avg_capacity >= float(cluster_threshold):
+                    cluster_volume = max(samples, key=lambda x: x[1])[0]
+                    cluster_pool = self.hub.topology.graph.nodes.get(cluster_volume, {}).get("pool_id") or "default_pool"
+                    if len(created) < max_new:
+                        _create_autoscale_node(cluster_pool, "cluster_capacity", cluster_volume)
+
+        # Per-volume DTF trigger
+        for vol in self.hub.topology.all_volumes():
+            if len(created) >= max_new:
+                break
+            try:
+                analysis = self.hub.analyze_volume(vol, timestamp)
+            except Exception:
+                continue
+            dtf = analysis.get("days_to_fill", {}).get("warning_85pct_days")
+            if dtf is None:
+                continue
+            if dtf <= autos.get("warning_days", 7):
+                pool = self.hub.topology.graph.nodes.get(vol, {}).get("pool_id") or "default_pool"
+                _create_autoscale_node(pool, "dtf_warning", vol)
+
+        if created:
+            self.last_autoscale_time = timestamp
+        return created

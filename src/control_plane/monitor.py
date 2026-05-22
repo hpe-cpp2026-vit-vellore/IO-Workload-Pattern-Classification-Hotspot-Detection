@@ -46,6 +46,26 @@ class ActionMonitor:
         self.total_actions += 1
         logger.info("Registered action %s for monitoring. Pre-latency: %.2f us", action_id, pre_latency)
 
+    def register_event(
+        self,
+        action_id: str,
+        action_state: Dict[str, Any],
+        timestamp: pd.Timestamp,
+        status: str = "success"
+    ) -> None:
+        """Register a non-latency action (e.g., autoscale) as an immediate event."""
+        self.actions[action_id] = {
+            "action_id": action_id,
+            "action_state": action_state,
+            "pre_latency": 0.0,
+            "timestamp": timestamp,
+            "status": status,
+            "elapsed_minutes": 0.0,
+            "current_latency": 0.0
+        }
+        self.total_actions += 1
+        logger.info("Registered event %s with status %s.", action_id, status)
+
     def update_metrics(
         self,
         action_id: str,

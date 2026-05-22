@@ -5,6 +5,13 @@ rebalance_policy:
   min_hotspot_duration_minutes: 2
   max_volumes_moved_per_hour: 3
   max_concurrent_migrations: 1
+  autoscale:
+    enabled: true
+    warning_days: 7
+    min_interval_hours: 24
+    max_new_nodes_per_run: 1
+    new_node_capacity_gb: 100
+    cluster_capacity_threshold_pct: 85
 
 safety_guardrails:
   rollback_if_target_latency_increases_pct: 20

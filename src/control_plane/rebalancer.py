@@ -28,6 +28,15 @@ class Rebalancer:
         if not source_node:
             raise ValueError(f"Volume {volume_id} not found in topology.")
 
+        # Placement validation: ensure move won't violate replica anti-affinity
+        try:
+            allowed = topology.validate_migration(volume_id, target_node)
+        except Exception:
+            allowed = False
+        if not allowed:
+            logger.warning("Migration for %s to %s blocked by placement constraints.", volume_id, target_node)
+            return {"action": "migrate", "volume_id": volume_id, "source_node": source_node, "target_node": target_node, "status": "blocked_by_placement"}
+
         if source_node == target_node:
             logger.info("Volume %s is already on %s. Migration skipped.", volume_id, target_node)
             return {"action": "migrate", "volume_id": volume_id, "source_node": source_node, "target_node": target_node, "status": "no-op"}
@@ -140,3 +149,36 @@ class Rebalancer:
             topology.graph.nodes[volume_id]["tier"] = old_tier
             
         logger.info("Rollback complete for volume %s", volume_id)
+
+    def add_virtual_node(self, node_id: str, capacity_gb: Optional[float], tier: Optional[str], topology: TopologyGraph) -> Dict[str, Any]:
+        """Add a new virtual/storage node to the topology (autoscaler helper).
+
+        This is intentionally lightweight: it registers a new storage node that the
+        autoscaler or operator can target for future migrations.
+        """
+        if topology.graph.has_node(node_id):
+            logger.info("Virtual node %s already exists.", node_id)
+            return {"action": "add_node", "node_id": node_id, "status": "exists"}
+
+        topology.add_storage_node(node_id, capacity_gb=capacity_gb, tier=tier)
+        logger.info("Added virtual node %s (cap=%s, tier=%s).", node_id, capacity_gb, tier)
+        return {"action": "add_node", "node_id": node_id, "capacity_gb": capacity_gb, "tier": tier, "status": "success"}
+
+    def expand_logical_pool(self, pool_id: str, new_node_id: str, topology: TopologyGraph) -> Dict[str, Any]:
+        """Expand a logical pool by adding `new_node_id` into its topology footprint.
+
+        Current simplified behaviour: ensure the node exists and mark the node as a candidate
+        for the pool by annotating volumes moved later via migrations. Full data path
+        attachment is out-of-scope for this prototype.
+        """
+        if not topology.graph.has_node(new_node_id):
+            raise ValueError(f"Node {new_node_id} does not exist; create it first with add_virtual_node.")
+
+        # Annotate the node as supporting the pool via node attribute 'pools'
+        pools = topology.graph.nodes[new_node_id].get("pools", [])
+        if pool_id not in pools:
+            pools.append(pool_id)
+            topology.graph.nodes[new_node_id]["pools"] = pools
+
+        logger.info("Expanded pool %s with node %s.", pool_id, new_node_id)
+        return {"action": "expand_pool", "pool_id": pool_id, "node_id": new_node_id, "status": "success"}

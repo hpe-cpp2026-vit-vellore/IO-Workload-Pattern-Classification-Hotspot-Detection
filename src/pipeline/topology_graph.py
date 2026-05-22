@@ -53,6 +53,11 @@ class TopologyGraph:
         # Auxiliary indices — keep these in sync with the graph at all times.
         self._volume_to_node: Dict[str, str] = {}          # volume_id -> node_id  O(1)
         self._node_volumes:   Dict[str, List[str]] = {}    # node_id   -> [volume_id, ...]  O(1)
+        # Replica relationships
+        # _replica_of maps replica_volume_id -> primary_volume_id
+        self._replica_of: Dict[str, str] = {}
+        # _replicas maps primary_volume_id -> [replica_volume_id, ...]
+        self._replicas: Dict[str, List[str]] = {}
 
     # ────────────────────────────────────────────────────────────────────
     # Construction
@@ -98,6 +103,10 @@ class TopologyGraph:
             capacity_gb=capacity_gb,
         )
         self.graph.add_edge(volume_id, node_id, relation="resides_on")
+
+        # Ensure replica indices are present for this volume (may be populated later)
+        self._replica_of.setdefault(volume_id, None)
+        self._replicas.setdefault(volume_id, [])
 
         # Keep auxiliary indices in sync.
         self._volume_to_node[volume_id] = node_id
@@ -208,6 +217,72 @@ class TopologyGraph:
                 for u, v, data in self.graph.edges(data=True)
             ],
         }
+
+    # ────────────────────────────────────────────────────────────────────
+    # Replica relationships and placement validation
+    # ────────────────────────────────────────────────────────────────────
+    def set_replica(self, replica_volume_id: str, primary_volume_id: str) -> None:
+        """Register that `replica_volume_id` is a replica of `primary_volume_id`.
+
+        This keeps both an index and a graph edge to make placements queryable.
+        """
+        # Ensure both volumes exist in the graph
+        if not self.graph.has_node(replica_volume_id) or not self.graph.has_node(primary_volume_id):
+            raise ValueError("Both primary and replica volumes must already be added to the topology.")
+
+        # Store mapping
+        self._replica_of[replica_volume_id] = primary_volume_id
+        self._replicas.setdefault(primary_volume_id, [])
+        if replica_volume_id not in self._replicas[primary_volume_id]:
+            self._replicas[primary_volume_id].append(replica_volume_id)
+
+        # Add a lightweight graph edge for visualization/inspection
+        if not self.graph.has_edge(replica_volume_id, primary_volume_id):
+            self.graph.add_edge(replica_volume_id, primary_volume_id, relation="replica_of")
+
+    def get_primary(self, volume_id: str) -> Optional[str]:
+        """Return the primary volume id for a replica, or None if the volume is primary or unknown."""
+        return self._replica_of.get(volume_id)
+
+    def get_replicas(self, primary_volume_id: str) -> List[str]:
+        """Return replicas for a given primary (may be empty)."""
+        return list(self._replicas.get(primary_volume_id, []))
+
+    def get_replica_group(self, volume_id: str) -> List[str]:
+        """Return all volumes in the replica group for `volume_id` (primary + replicas).
+
+        If the volume has a primary, the group is [primary] + replicas. If the volume is a primary,
+        the group is [primary] + replicas. If unknown, returns [volume_id].
+        """
+        primary = self.get_primary(volume_id)
+        if primary:
+            group = [primary] + self.get_replicas(primary)
+            return group
+        # If this volume is recorded as a primary
+        if volume_id in self._replicas and self._replicas.get(volume_id):
+            return [volume_id] + self.get_replicas(volume_id)
+        return [volume_id]
+
+    def validate_migration(self, volume_id: str, target_node: str) -> bool:
+        """Validate whether migrating `volume_id` to `target_node` would violate replica placement.
+
+        Current policy: anti-affinity at node granularity — no two replicas from the same
+        replica group (primary + replicas) may reside on the same storage node.
+        Returns True if migration is allowed, False otherwise.
+        """
+        if not self.graph.has_node(volume_id):
+            return False
+
+        # Build the replica group for the volume
+        group = self.get_replica_group(volume_id)
+
+        # For each volume in the group, check its current node. If any already resides on target_node,
+        # the migration would colocate replicas and must be disallowed.
+        for v in group:
+            node = self._volume_to_node.get(v)
+            if node == target_node:
+                return False
+        return True
 
     # ────────────────────────────────────────────────────────────────────
     # Visualisation (Plotly)
