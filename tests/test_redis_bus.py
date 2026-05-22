@@ -100,7 +100,7 @@ class TestRedisBusAndFallback(unittest.TestCase):
         """Verify Redis Streams publisher-subscriber and consumer group interactions if Redis is available."""
         try:
             import redis
-            r = redis.Redis(host="localhost", port=6379, socket_connect_timeout=2)
+            r = redis.Redis(host="localhost", port=6379, socket_connect_timeout=2, decode_responses=True)
             r.ping()
         except Exception:
             self.skipTest("Local Redis server is not running on localhost:6379. Skipping Redis-specific tests.")

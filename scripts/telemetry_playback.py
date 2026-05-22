@@ -173,7 +173,6 @@ def connect_redis():
             socket_timeout=5,
             socket_keepalive=True,
             socket_keepalive_options=socket_keepalive_options,
-            retry_on_timeout=True,
             health_check_interval=15,
         )
         client.ping()

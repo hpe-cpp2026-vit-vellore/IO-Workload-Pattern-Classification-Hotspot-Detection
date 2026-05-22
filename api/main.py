@@ -35,6 +35,7 @@ if str(ANOMALY_DIR) not in sys.path:
     sys.path.insert(0, str(ANOMALY_DIR))
 
 from src.control_plane import InferenceHub, Rebalancer, ActionMonitor, DecisionEngine, WhatIfSimulator
+from src.pipeline.telemetry_parser import parse_and_clip, load_or_create_bounds
 from api.schemas.models import (
     SimulateCapacityRequest,
     SimulateMigrateRequest,
@@ -76,6 +77,7 @@ monitor: Optional[ActionMonitor] = None
 engine: Optional[DecisionEngine] = None
 simulator: Optional[WhatIfSimulator] = None
 explainer: Optional[shap.TreeExplainer] = None
+bounds: Dict[str, Any] = {}
 
 # Active SSE connections
 active_streams: Dict[str, List[asyncio.Queue]] = {}
@@ -324,11 +326,12 @@ cached_analysis = RedisBackedCache()
 live_state = LiveTelemetryState()
 
 def sync_topology_from_redis():
-    """Synchronizes in-memory topology metrics with latest metrics in Redis."""
+    """Synchronizes in-memory topology metrics and structure with latest metrics in Redis."""
     global use_redis, r, hub
     STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
     if use_redis and r is not None and hub is not None:
         try:
+            # 1. Sync metrics
             for vol_id in hub.features_df["volume_id"].unique():
                 metrics_data = r.hgetall(f"volume:{vol_id}:metrics")
                 if metrics_data:
@@ -347,6 +350,43 @@ def sync_topology_from_redis():
                             except ValueError:
                                 typed_metrics[k] = v
                     hub.topology.update_volume_metrics(vol_id, typed_metrics)
+
+            # 2. Sync topology structure assignments
+            assignments = r.hgetall("topology:volume_to_node")
+            for vol_id, target_node in assignments.items():
+                if hub.topology.graph.has_node(vol_id) and target_node:
+                    source_node = hub.topology.get_node_of_volume(vol_id)
+                    if source_node != target_node:
+                        logger.info("Syncing topology structure: moving %s from %s to %s (from Redis)", vol_id, source_node, target_node)
+                        if source_node and hub.topology.graph.has_edge(vol_id, source_node):
+                            hub.topology.graph.remove_edge(vol_id, source_node)
+                        hub.topology.graph.add_edge(vol_id, target_node, relation="resides_on")
+                        hub.topology._volume_to_node[vol_id] = target_node
+                        if source_node and vol_id in hub.topology._node_volumes.get(source_node, []):
+                            hub.topology._node_volumes[source_node].remove(vol_id)
+                        if target_node not in hub.topology._node_volumes:
+                            hub.topology._node_volumes[target_node] = []
+                        if vol_id not in hub.topology._node_volumes[target_node]:
+                            hub.topology._node_volumes[target_node].append(vol_id)
+                        hub.topology.graph.nodes[vol_id]["node_id"] = target_node
+
+            # 3. Sync storage tiers
+            tiers = r.hgetall("topology:volume_tier")
+            for vol_id, tier in tiers.items():
+                if hub.topology.graph.has_node(vol_id) and tier:
+                    hub.topology.graph.nodes[vol_id]["tier"] = tier
+
+            # 4. Sync QoS IOPS limits
+            limits = r.hgetall("topology:volume_iops_limit")
+            for vol_id, limit_str in limits.items():
+                if hub.topology.graph.has_node(vol_id):
+                    if limit_str == "None" or limit_str == "":
+                        hub.topology.graph.nodes[vol_id].pop("iops_limit", None)
+                    else:
+                        try:
+                            hub.topology.graph.nodes[vol_id]["iops_limit"] = float(limit_str)
+                        except ValueError:
+                            pass
         except Exception as e:
             logger.error(f"Error syncing topology from Redis: {e}")
 
@@ -496,10 +536,26 @@ def _append_feature_rows(rows: List[Dict[str, Any]]) -> None:
 
 async def _analyze_and_cache_volume(volume_id: str, ts: pd.Timestamp) -> None:
     """Run heavier per-volume inference outside the ingestion hot path."""
-    global analysis_tasks
+    global analysis_tasks, hub, engine, use_redis
     try:
         if hub is not None:
-            cached_analysis[volume_id] = await asyncio.to_thread(hub.analyze_volume, volume_id, ts)
+            analysis = await asyncio.to_thread(hub.analyze_volume, volume_id, ts)
+            cached_analysis[volume_id] = analysis
+            
+            if engine is not None and engine.enabled:
+                action_result = await asyncio.to_thread(engine.evaluate_volume, volume_id, ts, analysis)
+                if action_result:
+                    _persist_control_plane_state()
+                    if use_redis:
+                        _persist_topology_to_redis(volume_id)
+                
+                queued_results = await asyncio.to_thread(engine.process_queued_actions, ts)
+                if queued_results:
+                    if queued_results.get("migrations") or queued_results.get("autoscale"):
+                        _persist_control_plane_state()
+                        if use_redis:
+                            for q_res in queued_results.get("migrations", []):
+                                _persist_topology_to_redis(q_res["volume_id"])
     except Exception as e:
         logger.error("Background analysis failed for %s at %s: %s", volume_id, ts, e)
     finally:
@@ -519,7 +575,7 @@ def _schedule_volume_analysis(volume_id: str, ts: pd.Timestamp) -> None:
 
 async def handle_tcp_client(reader, writer):
     """TCP Handler for playback agent streaming metrics directly to FastAPI when Redis is offline."""
-    global hub, cached_analysis, active_streams, last_analyzed_time
+    global hub, cached_analysis, active_streams, last_analyzed_time, bounds
     
     # Columns that should remain as strings
     STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
@@ -533,23 +589,21 @@ async def handle_tcp_client(reader, writer):
             if not line:
                 break
             try:
-                data = json.loads(line.decode("utf-8").strip())
+                raw_line = line.decode("utf-8").strip()
+                data = parse_and_clip(raw_line, bounds)
                 volume_id = data.get("volume_id")
                 timestamp_str = data.get("timestamp")
                 if volume_id and timestamp_str:
                     ts = pd.to_datetime(timestamp_str)
                     
-                    # Cast all non-string fields to proper numeric types
+                    # Ensure type/fallback safety for all columns to not break downstream components
                     event = {}
                     for k, v in data.items():
                         if k in STRING_COLS:
-                            event[k] = v
+                            event[k] = str(v) if v is not None else ""
                         elif v is None or v == "" or v == "None" or v == "NaN" or v == "nan":
                             event[k] = 0.0
-                        elif isinstance(v, (int, float)):
-                            event[k] = float(v)
                         else:
-                            # Try to parse string-encoded numbers
                             try:
                                 event[k] = float(v)
                             except (ValueError, TypeError):
@@ -631,11 +685,258 @@ async def _start_tcp_fallback_server() -> None:
     bound = ", ".join(str(sock.getsockname()) for sock in sockets) or f"{TCP_FALLBACK_HOST}:{TCP_FALLBACK_PORT}"
     logger.info("TCP fallback server listening on %s.", bound)
 
+
+def _load_control_plane_state():
+    """Load rebalance history and monitors from JSON file and Redis (if available)."""
+    global engine, monitor, use_redis, r
+    # 1. Load from local JSON first
+    history_file = PROJECT_ROOT / "data" / "processed" / "rebalance_history.json"
+    if history_file.exists():
+        try:
+            with open(history_file, "r") as f:
+                data = json.load(f)
+                history = data.get("action_history", [])
+                monitors = data.get("active_monitors", {})
+                autoscale_state = data.get("autoscale_state", {})
+                
+                # Deserialize timestamps
+                for act in history:
+                    act["timestamp"] = pd.to_datetime(act["timestamp"])
+                for aid, mon in monitors.items():
+                    mon["timestamp"] = pd.to_datetime(mon["timestamp"])
+                    
+                if engine is not None:
+                    engine.action_history = history
+                    last_autoscale = autoscale_state.get("last_autoscale_time")
+                    engine.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
+                if monitor is not None:
+                    monitor.actions = monitors
+                    monitor.total_actions = len(monitors)
+                    monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
+            logger.info("Successfully loaded rebalance history from JSON file.")
+        except Exception as e:
+            logger.error("Failed to load rebalance history from JSON file: %s", e)
+
+    # 2. Synchronize/Overwrite from Redis if active
+    if use_redis and r is not None:
+        try:
+            raw_history = r.get("control_plane:action_history")
+            if raw_history:
+                history = json.loads(raw_history)
+                for act in history:
+                    act["timestamp"] = pd.to_datetime(act["timestamp"])
+                if engine is not None:
+                    engine.action_history = history
+            
+            raw_monitors = r.hgetall("control_plane:active_monitors")
+            if raw_monitors:
+                monitors = {}
+                for aid, raw_mon in raw_monitors.items():
+                    mon = json.loads(raw_mon)
+                    mon["timestamp"] = pd.to_datetime(mon["timestamp"])
+                    monitors[aid] = mon
+                if monitor is not None:
+                    monitor.actions = monitors
+                    monitor.total_actions = len(monitors)
+                    monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
+            
+            raw_queue = r.get("control_plane:action_queue")
+            if raw_queue and engine is not None:
+                queue = json.loads(raw_queue)
+                for q in queue:
+                    q["timestamp"] = pd.to_datetime(q["timestamp"])
+                engine.action_queue = queue
+
+            raw_autoscale = r.get("control_plane:autoscale_state")
+            if raw_autoscale and engine is not None:
+                autoscale_state = json.loads(raw_autoscale)
+                last_autoscale = autoscale_state.get("last_autoscale_time")
+                engine.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
+                
+            logger.info("Successfully synchronized control plane state from Redis.")
+        except Exception as e:
+            logger.error("Failed to load control plane state from Redis: %s", e)
+
+
+def _persist_control_plane_state():
+    """Save rebalance history and monitors to JSON file and Redis (if available)."""
+    global engine, monitor, use_redis, r
+    if engine is None or monitor is None:
+        return
+
+    # Deep serialize timestamps to ISO format
+    def _serialize_dict(d):
+        serialized = {}
+        for k, v in d.items():
+            if isinstance(v, pd.Timestamp):
+                serialized[k] = v.isoformat()
+            elif isinstance(v, dict):
+                serialized[k] = _serialize_dict(v)
+            elif isinstance(v, list):
+                serialized[k] = [
+                    _serialize_dict(item) if isinstance(item, dict) else (item.isoformat() if isinstance(item, pd.Timestamp) else item)
+                    for item in v
+                ]
+            else:
+                serialized[k] = v
+        return serialized
+
+    serialized_history = [_serialize_dict(act) for act in engine.action_history]
+    serialized_monitors = {aid: _serialize_dict(mon) for aid, mon in monitor.actions.items()}
+    serialized_queue = [_serialize_dict(q) for q in engine.action_queue]
+    autoscale_state = {
+        "last_autoscale_time": engine.last_autoscale_time.isoformat() if engine.last_autoscale_time else None
+    }
+
+    # Save to local JSON
+    history_file = PROJECT_ROOT / "data" / "processed" / "rebalance_history.json"
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        temp_file = history_file.with_suffix(".tmp")
+        with open(temp_file, "w") as f:
+            json.dump({
+                "action_history": serialized_history,
+                "active_monitors": serialized_monitors,
+                "action_queue": serialized_queue,
+                "autoscale_state": autoscale_state
+            }, f, indent=2)
+        import os
+        if history_file.exists():
+            os.replace(str(temp_file), str(history_file))
+        else:
+            temp_file.rename(history_file)
+    except Exception as e:
+        logger.error("Failed to write rebalance history to JSON: %s", e)
+
+    # Save to Redis if available
+    if use_redis and r is not None:
+        try:
+            r.set("control_plane:action_history", json.dumps(serialized_history))
+            r.set("control_plane:action_queue", json.dumps(serialized_queue))
+            r.set("control_plane:autoscale_state", json.dumps(autoscale_state))
+            r.delete("control_plane:active_monitors")
+            if serialized_monitors:
+                r.hset("control_plane:active_monitors", mapping={aid: json.dumps(mon) for aid, mon in serialized_monitors.items()})
+        except Exception as e:
+            logger.error("Failed to persist control plane state to Redis: %s", e)
+
+
+def _sync_monitors_from_redis():
+    """Sync monitors and history from Redis in background loop."""
+    global monitor, engine, r
+    if r is None or monitor is None or engine is None:
+        return
+    try:
+        raw_monitors = r.hgetall("control_plane:active_monitors")
+        monitors = {}
+        for aid, raw_mon in raw_monitors.items():
+            mon = json.loads(raw_mon)
+            mon["timestamp"] = pd.to_datetime(mon["timestamp"])
+            monitors[aid] = mon
+        
+        monitor.actions = monitors
+        monitor.total_actions = len(monitors)
+        monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
+
+        raw_history = r.get("control_plane:action_history")
+        if raw_history:
+            history = json.loads(raw_history)
+            for act in history:
+                act["timestamp"] = pd.to_datetime(act["timestamp"])
+            engine.action_history = history
+            
+        raw_queue = r.get("control_plane:action_queue")
+        if raw_queue:
+            queue = json.loads(raw_queue)
+            for q in queue:
+                q["timestamp"] = pd.to_datetime(q["timestamp"])
+            engine.action_queue = queue
+        raw_autoscale = r.get("control_plane:autoscale_state")
+        if raw_autoscale:
+            autoscale_state = json.loads(raw_autoscale)
+            last_autoscale = autoscale_state.get("last_autoscale_time")
+            engine.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
+    except Exception as e:
+        logger.warning("Error syncing monitors from Redis in background loop: %s", e)
+
+
+def _persist_topology_to_redis(volume_id: str):
+    """Save dynamic topology adjustments of a volume to Redis."""
+    global r, use_redis, hub
+    if not use_redis or r is None or hub is None:
+        return
+    try:
+        node_id = hub.topology.get_node_of_volume(volume_id)
+        if node_id:
+            r.hset("topology:volume_to_node", volume_id, node_id)
+        
+        tier = hub.topology.graph.nodes[volume_id].get("tier")
+        if tier:
+            r.hset("topology:volume_tier", volume_id, tier)
+
+        limit = hub.topology.graph.nodes[volume_id].get("iops_limit")
+        r.hset("topology:volume_iops_limit", volume_id, str(limit))
+    except Exception as e:
+        logger.error("Failed to persist topology to Redis for volume %s: %s", volume_id, e)
+
+
+async def action_monitor_loop():
+    """Background monitoring loop to check target latencies and trigger rollbacks."""
+    global monitor, rebalancer, hub, use_redis, r, engine
+    logger.info("Started FastAPI rebalance action monitoring loop.")
+    while True:
+        try:
+            await asyncio.sleep(5)
+            if monitor is None or rebalancer is None or hub is None:
+                continue
+
+            if use_redis and r is not None:
+                _sync_monitors_from_redis()
+
+            active_ids = [aid for aid, act in monitor.actions.items() if act["status"] == "monitoring"]
+            if not active_ids:
+                continue
+
+            for aid in active_ids:
+                action = monitor.actions[aid]
+                vol_id = action["action_state"]["volume_id"]
+
+                current_latency = 0.0
+                live_event = live_state.latest_by_volume.get(vol_id)
+                if live_event is not None:
+                    current_latency = float(live_event.get("avg_latency_us", 0.0) or 0.0)
+                else:
+                    metrics_dict = hub.topology._volume_metrics.get(vol_id, {})
+                    current_latency = float(metrics_dict.get("avg_latency_us", 0.0) or 0.0)
+
+                elapsed_min = (pd.Timestamp.now() - action["timestamp"]).total_seconds() / 60.0
+
+                new_status = monitor.update_metrics(
+                    action_id=aid,
+                    current_latency=current_latency,
+                    elapsed_minutes=elapsed_min,
+                    rebalancer=rebalancer,
+                    topology=hub.topology
+                )
+
+                if new_status != "monitoring":
+                    for h_action in engine.action_history:
+                        if h_action.get("action_id") == aid:
+                            h_action["status"] = new_status
+                            break
+                    _persist_control_plane_state()
+                    if use_redis and r is not None:
+                        _persist_topology_to_redis(vol_id)
+        except Exception as e:
+            logger.error("Error in action_monitor_loop: %s", e)
+
+
 @app.on_event("startup")
 async def startup_event():
-    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis, r, use_redis, redis_error
+    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis, r, use_redis, redis_error, bounds
     logger.info("Initializing Control Plane engines and loading ML models...")
     
+    bounds = load_or_create_bounds(PROJECT_ROOT)
     hub = InferenceHub(project_root=PROJECT_ROOT)
     rebalancer = Rebalancer()
     monitor = ActionMonitor(
@@ -668,6 +969,9 @@ async def startup_event():
             r.ping()
             use_redis = True
             logger.info("Successfully connected to Redis at %s:%s. Redis mode active.", REDIS_HOST, REDIS_PORT)
+            
+            # Sync topology structure from Redis on start
+            sync_topology_from_redis()
         except Exception as e:
             redis_error = str(e)
             use_redis = False
@@ -679,6 +983,9 @@ async def startup_event():
                 redis_error,
                 TCP_FALLBACK_PORT
             )
+
+    # Load control plane state
+    _load_control_plane_state()
 
     # Start live stream background tasks
     if use_redis:
@@ -693,6 +1000,9 @@ async def startup_event():
                 TCP_FALLBACK_PORT,
                 e
             )
+    
+    # Start action monitor background loop
+    asyncio.create_task(action_monitor_loop())
     
     # Pre-warm cache in the BACKGROUND so /health responds immediately
     asyncio.create_task(_warmup_cache())
@@ -966,12 +1276,14 @@ def get_volume_explanation(id: str):
     row = hub.get_raw_feature_row(id, pd.to_datetime(explain_ts))
     
     classifier_feature_cols = hub.classifier_scaler.feature_names_in_.tolist()
-    features_vec = row[classifier_feature_cols].values.astype(np.float64).reshape(1, -1)
-    features_log = np.sign(features_vec) * np.log1p(np.abs(features_vec))
-    features_scaled = hub.classifier_scaler.transform(features_log)
+    features_arr = row[classifier_feature_cols].to_numpy(dtype=np.float64).reshape(1, -1)
+    features_log = np.sign(features_arr) * np.log1p(np.abs(features_arr))
+    features_log_df = pd.DataFrame(features_log, columns=classifier_feature_cols)
+    features_scaled = hub.classifier_scaler.transform(features_log_df)
+    features_scaled_df = pd.DataFrame(features_scaled, columns=classifier_feature_cols)
     
-    pred_class = int(hub.classifier.predict(features_scaled)[0])
-    shap_vals = explainer.shap_values(features_scaled)
+    pred_class = int(hub.classifier.predict(features_scaled_df)[0])
+    shap_vals = explainer.shap_values(features_scaled_df)
     
     if isinstance(shap_vals, list):
         cls_shap = shap_vals[pred_class][0]
@@ -1254,10 +1566,75 @@ def update_policy(req: PolicyUpdateRequest):
         if "rollback_timeout_minutes" in safety:
             monitor.rollback_timeout_minutes = safety["rollback_timeout_minutes"]
             
+    # Persist policy changes to Redis if active
+    if use_redis and r is not None:
+        try:
+            r.set("control_plane:policy", json.dumps(engine.policy))
+        except Exception as e:
+            logger.error("Failed to persist policy to Redis: %s", e)
+            
     return {"status": "success", "message": "Policy parameters updated successfully.", "policy": engine.policy}
 
 
 # --- Execution Control Endpoints ---
+
+@app.get("/rebalance/history", status_code=status.HTTP_200_OK)
+def get_rebalance_history():
+    """Retrieve all rebalancing actions executed or logged."""
+    global engine, use_redis, r
+    if engine is None:
+        return []
+    
+    if use_redis and r is not None:
+        _sync_monitors_from_redis()
+        
+    def _serialize_act(act):
+        serialized = {}
+        for k, v in act.items():
+            if isinstance(v, pd.Timestamp):
+                serialized[k] = v.isoformat()
+            elif isinstance(v, dict):
+                serialized[k] = _serialize_act(v)
+            elif isinstance(v, list):
+                serialized[k] = [
+                    _serialize_act(item) if isinstance(item, dict) else (item.isoformat() if isinstance(item, pd.Timestamp) else item)
+                    for item in v
+                ]
+            else:
+                serialized[k] = v
+        return serialized
+        
+    return [_serialize_act(act) for act in engine.action_history]
+
+
+@app.get("/rebalance/monitors", status_code=status.HTTP_200_OK)
+def get_rebalance_monitors():
+    """Retrieve active and historical action monitors."""
+    global monitor, use_redis, r
+    if monitor is None:
+        return {}
+        
+    if use_redis and r is not None:
+        _sync_monitors_from_redis()
+        
+    def _serialize_mon(mon):
+        serialized = {}
+        for k, v in mon.items():
+            if isinstance(v, pd.Timestamp):
+                serialized[k] = v.isoformat()
+            elif isinstance(v, dict):
+                serialized[k] = _serialize_mon(v)
+            elif isinstance(v, list):
+                serialized[k] = [
+                    _serialize_mon(item) if isinstance(item, dict) else (item.isoformat() if isinstance(item, pd.Timestamp) else item)
+                    for item in v
+                ]
+            else:
+                serialized[k] = v
+        return serialized
+        
+    return {aid: _serialize_mon(mon) for aid, mon in monitor.actions.items()}
+
 
 @app.post("/rebalance", status_code=status.HTTP_200_OK)
 def trigger_rebalance(req: RebalanceRequest):
@@ -1292,6 +1669,31 @@ def trigger_rebalance(req: RebalanceRequest):
         timestamp=pd.Timestamp.now()
     )
     
+    # Log to action history
+    exec_record = {
+        "action_id": action_id,
+        "volume_id": req.volume_id,
+        "action": req.action_type,
+        "choice": {
+            "action": req.action_type,
+            "target_node": req.target if req.action_type == "migrate" else None,
+            "iops_limit": float(req.target) if req.action_type == "qos" else None,
+            "new_tier": req.target if req.action_type == "tier_change" else None,
+            "expected_improvement": 0.0,
+            "safe": True
+        },
+        "timestamp": pd.Timestamp.now(),
+        "action_state": action_state,
+        "status": "executed"
+    }
+    if engine is not None:
+        engine.action_history.append(exec_record)
+        
+    # Persist changes
+    _persist_control_plane_state()
+    if use_redis:
+        _persist_topology_to_redis(req.volume_id)
+    
     return {
         "status": "success",
         "action_id": action_id,
@@ -1310,6 +1712,19 @@ def trigger_rollback(req: RollbackRequest):
         rebalancer.rollback_action(action["action_state"], hub.topology)
         action["status"] = "rolled_back"
         monitor.rolled_back_count += 1
+        
+        # Update status in history log
+        if engine is not None:
+            for h_action in engine.action_history:
+                if h_action.get("action_id") == req.action_id:
+                    h_action["status"] = "rolled_back"
+                    break
+                    
+        # Persist changes
+        _persist_control_plane_state()
+        if use_redis:
+            _persist_topology_to_redis(action["action_state"]["volume_id"])
+            
         return {"status": "success", "message": f"Action {req.action_id} successfully rolled back."}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
@@ -1351,6 +1766,170 @@ def get_topology():
                 })
                 
     return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/model/performance", status_code=status.HTTP_200_OK)
+def get_model_performance():
+    """Evaluate LightGBM model performance on validation data."""
+    global hub
+    label_names = {
+        0: "DB_OLTP",
+        1: "VM",
+        2: "Backup",
+        3: "AI_Training",
+        4: "AI_Inference",
+    }
+
+    def _load_from_artifacts() -> Optional[Dict[str, Any]]:
+        metrics_candidates = [
+            PROJECT_ROOT / "models" / "classifier" / "lightgbm_tuned_metrics.json",
+            PROJECT_ROOT / "models" / "classifier" / "lightgbm_metrics.json",
+        ]
+
+        for metrics_path in metrics_candidates:
+            if not metrics_path.exists():
+                continue
+            try:
+                with metrics_path.open("r", encoding="utf-8") as f:
+                    metrics = json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to read metrics from %s: %s", metrics_path, exc)
+                continue
+
+            val_metrics = metrics.get("val") or metrics.get("validation")
+            if not val_metrics:
+                continue
+
+            report = val_metrics.get("classification_report", {})
+            accuracy = float(val_metrics.get("accuracy", report.get("accuracy", 0.0)))
+
+            cm = None
+            cm_path = val_metrics.get("confusion_matrix_path")
+            if cm_path:
+                cm_file = PROJECT_ROOT / cm_path
+            else:
+                cm_file = None
+
+            if cm_file and cm_file.exists():
+                cm_df = pd.read_csv(cm_file, index_col=0)
+                cm = cm_df.values.tolist()
+            else:
+                fallback_names = [
+                    "lightgbm_tuned_confusion_matrix_val.csv",
+                    "lightgbm_confusion_matrix_val.csv",
+                ]
+                for name in fallback_names:
+                    fallback = PROJECT_ROOT / "models" / "classifier" / name
+                    if fallback.exists():
+                        cm_df = pd.read_csv(fallback, index_col=0)
+                        cm = cm_df.values.tolist()
+                        break
+
+            cm_norm = []
+            if cm:
+                for row in cm:
+                    row_sum = sum(row)
+                    if row_sum > 0:
+                        cm_norm.append([round((val / row_sum) * 100.0, 2) for val in row])
+                    else:
+                        cm_norm.append([0.0 for _ in row])
+
+            metrics_per_class: Dict[str, Any] = {}
+            for cls_id, cls_name in label_names.items():
+                cls_key = str(cls_id)
+                if cls_key not in report:
+                    continue
+                cls_report = report[cls_key]
+                metrics_per_class[cls_name] = {
+                    "precision": round(float(cls_report.get("precision", 0.0)), 4),
+                    "recall": round(float(cls_report.get("recall", 0.0)), 4),
+                    "f1_score": round(float(cls_report.get("f1-score", 0.0)), 4),
+                    "support": int(cls_report.get("support", 0)),
+                }
+
+            sample_count = int(sum(m.get("support", 0) for m in metrics_per_class.values()))
+
+            return {
+                "accuracy": round(accuracy, 4),
+                "confusion_matrix": cm or [],
+                "confusion_matrix_percentage": cm_norm,
+                "metrics_per_class": metrics_per_class,
+                "sample_count": sample_count,
+            }
+
+        return None
+
+    artifact_payload = _load_from_artifacts()
+    if artifact_payload:
+        return artifact_payload
+
+    if hub is None:
+        raise HTTPException(status_code=503, detail="Model hub not initialized.")
+
+    try:
+        val_X_path = PROJECT_ROOT / "data" / "features" / "X_val.parquet"
+        val_y_path = PROJECT_ROOT / "data" / "features" / "y_val.parquet"
+
+        if not val_X_path.exists() or not val_y_path.exists():
+            raise HTTPException(status_code=404, detail="Validation features parquet files not found.")
+
+        X_val = pd.read_parquet(val_X_path)
+        y_val = pd.read_parquet(val_y_path)
+
+        if "label" not in y_val.columns:
+            raise HTTPException(status_code=500, detail="Validation labels missing 'label' column.")
+
+        y_true = y_val["label"].values.astype(int)
+
+        if hasattr(hub.classifier, "feature_names_in_"):
+            X_val = X_val[hub.classifier.feature_names_in_.tolist()]
+
+        y_pred = hub.classifier.predict(X_val).astype(int)
+
+        accuracy = float((y_pred == y_true).mean())
+
+        num_classes = 5
+        cm = [[0 for _ in range(num_classes)] for _ in range(num_classes)]
+        for t, p in zip(y_true, y_pred):
+            if 0 <= t < num_classes and 0 <= p < num_classes:
+                cm[t][p] += 1
+
+        cm_norm = []
+        for row in cm:
+            row_sum = sum(row)
+            if row_sum > 0:
+                cm_norm.append([round((val / row_sum) * 100.0, 2) for val in row])
+            else:
+                cm_norm.append([0.0 for _ in row])
+
+        metrics_per_class = {}
+        for c in range(num_classes):
+            tp = cm[c][c]
+            fp = sum(cm[i][c] for i in range(num_classes)) - tp
+            fn = sum(cm[c][j] for j in range(num_classes)) - tp
+
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            metrics_per_class[label_names[c]] = {
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1_score": round(f1, 4),
+                "support": int(tp + fn),
+            }
+
+        return {
+            "accuracy": round(accuracy, 4),
+            "confusion_matrix": cm,
+            "confusion_matrix_percentage": cm_norm,
+            "metrics_per_class": metrics_per_class,
+            "sample_count": len(y_true),
+        }
+    except Exception as e:
+        logger.error("Failed to compute model performance: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=False)
