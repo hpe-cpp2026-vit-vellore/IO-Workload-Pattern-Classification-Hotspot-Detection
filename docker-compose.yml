@@ -1,0 +1,53 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: hpe-control-plane:latest
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 2
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_RETRY_ATTEMPTS: "5"
+      REDIS_RETRY_DELAY: "5"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+      - ./configs:/app/configs
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    image: hpe-control-plane:latest
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "8501:8501"
+    environment:
+      HPE_API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:

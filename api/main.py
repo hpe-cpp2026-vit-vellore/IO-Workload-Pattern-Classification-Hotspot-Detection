@@ -137,7 +137,12 @@ def _detect_redis_host() -> str:
     'localhost' is deliberately excluded because Windows resolves it
     through a flaky WSL2 NAT layer that drops long-lived TCP connections.
     """
+    import os
     import subprocess, socket as _sock
+    env_host = os.environ.get("REDIS_HOST", "").strip()
+    if env_host:
+        logger.info("Using REDIS_HOST from environment: %s", env_host)
+        return env_host
     candidates = []
     try:
         result = subprocess.run(
@@ -933,7 +938,7 @@ async def action_monitor_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis, r, use_redis, redis_error, bounds
+    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis, r, use_redis, redis_error, bounds, REDIS_HOST
     logger.info("Initializing Control Plane engines and loading ML models...")
     
     bounds = load_or_create_bounds(PROJECT_ROOT)
@@ -957,6 +962,17 @@ async def startup_event():
     # Detect Redis host NOW (not at import time) so WSL2 networking is fully ready.
     REDIS_HOST = _detect_redis_host()
 
+    import os
+    try:
+        redis_retry_attempts = int(os.environ.get("REDIS_RETRY_ATTEMPTS", "5"))
+    except ValueError:
+        redis_retry_attempts = 5
+    redis_retry_attempts = max(1, redis_retry_attempts)
+    try:
+        redis_retry_delay = float(os.environ.get("REDIS_RETRY_DELAY", "3"))
+    except ValueError:
+        redis_retry_delay = 3.0
+
     # Try to connect to Redis. If unavailable, the API owns a direct TCP fallback.
     redis_error = None
     if redis is None:
@@ -964,25 +980,37 @@ async def startup_event():
         redis_error = "Python package 'redis' is not installed."
         logger.warning("%s Activating TCP fallback mode on port %s.", redis_error, TCP_FALLBACK_PORT)
     else:
-        try:
-            r = _create_redis_client()
-            r.ping()
-            use_redis = True
-            logger.info("Successfully connected to Redis at %s:%s. Redis mode active.", REDIS_HOST, REDIS_PORT)
-            
-            # Sync topology structure from Redis on start
-            sync_topology_from_redis()
-        except Exception as e:
-            redis_error = str(e)
-            use_redis = False
-            r = None
-            logger.warning(
-                "Could not connect to Redis at %s:%s: %s. Activating TCP fallback mode on port %s.",
-                REDIS_HOST,
-                REDIS_PORT,
-                redis_error,
-                TCP_FALLBACK_PORT
-            )
+        for attempt in range(1, redis_retry_attempts + 1):
+            try:
+                r = _create_redis_client()
+                r.ping()
+                use_redis = True
+                logger.info("Successfully connected to Redis at %s:%s. Redis mode active.", REDIS_HOST, REDIS_PORT)
+                
+                # Sync topology structure from Redis on start
+                sync_topology_from_redis()
+                break
+            except Exception as e:
+                redis_error = str(e)
+                use_redis = False
+                r = None
+                if attempt < redis_retry_attempts:
+                    logger.warning(
+                        "Redis connect attempt %d/%d failed: %s. Retrying in %ss...",
+                        attempt,
+                        redis_retry_attempts,
+                        redis_error,
+                        redis_retry_delay
+                    )
+                    await asyncio.sleep(redis_retry_delay)
+                else:
+                    logger.warning(
+                        "Could not connect to Redis at %s:%s: %s. Activating TCP fallback mode on port %s.",
+                        REDIS_HOST,
+                        REDIS_PORT,
+                        redis_error,
+                        TCP_FALLBACK_PORT
+                    )
 
     # Load control plane state
     _load_control_plane_state()
