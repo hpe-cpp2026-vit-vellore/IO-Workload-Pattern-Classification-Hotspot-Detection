@@ -291,6 +291,30 @@ if telemetry_bus:
 else:
     st.sidebar.caption("Telemetry status unavailable until the API is restarted.")
 
+circuit_breaker = get_api_data("/rebalance/circuit-breaker") or {}
+if circuit_breaker.get("circuit_breaker_tripped"):
+    reason = circuit_breaker.get("reason", "Circuit breaker tripped.")
+    st.markdown(
+        f"""
+        <div style="
+            background: rgba(255, 23, 68, 0.10);
+            border: 1px solid rgba(255, 23, 68, 0.35);
+            border-left: 6px solid #ff1744;
+            border-radius: 10px;
+            padding: 12px 16px;
+            margin: 8px 0 18px 0;
+        ">
+            <strong style="color:#ff6b81;">Circuit Breaker Tripped</strong><br/>
+            <span style="color:#c9d1d9;">{reason}</span><br/>
+            <span style="color:#8b949e;">Auto-rebalancing is disabled until the breaker is reset.</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.sidebar.error("Circuit Breaker: TRIPPED")
+else:
+    st.sidebar.success("Circuit Breaker: OK")
+
 
 # ────────────────────────────────────────────────────────────────────
 # PAGE 1: LIVE OVERVIEW

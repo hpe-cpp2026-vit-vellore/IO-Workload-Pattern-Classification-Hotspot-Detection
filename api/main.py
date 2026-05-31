@@ -1606,6 +1606,10 @@ def update_policy(req: PolicyUpdateRequest):
         # Sync attributes
         if "enabled" in rebalance:
             engine.enabled = rebalance["enabled"]
+            if rebalance["enabled"]:
+                engine.circuit_breaker_tripped = False
+                engine.circuit_breaker_tripped_at = None
+                engine.circuit_breaker_reason = ""
         if "dry_run_mode" in rebalance:
             engine.dry_run_mode = rebalance["dry_run_mode"]
         if "min_hotspot_score_to_trigger" in rebalance:
@@ -1633,6 +1637,35 @@ def update_policy(req: PolicyUpdateRequest):
             logger.error("Failed to persist policy to Redis: %s", e)
             
     return {"status": "success", "message": "Policy parameters updated successfully.", "policy": engine.policy}
+
+
+@app.get("/rebalance/circuit-breaker", status_code=200)
+def get_circuit_breaker_status():
+    if engine is None:
+        return {"circuit_breaker_tripped": False, "engine_ready": False}
+    return {
+        "circuit_breaker_tripped": engine.circuit_breaker_tripped,
+        "tripped_at": engine.circuit_breaker_tripped_at.isoformat()
+                     if engine.circuit_breaker_tripped_at else None,
+        "reason": engine.circuit_breaker_reason,
+        "current_rollback_rate_pct": monitor.get_rollback_rate() if monitor else 0.0,
+        "max_rollback_rate_pct": engine.max_rollback_rate_pct,
+        "total_actions": monitor.total_actions if monitor else 0,
+        "engine_enabled": engine.enabled,
+    }
+
+
+@app.post("/rebalance/circuit-breaker/reset", status_code=200)
+def reset_circuit_breaker():
+    """Manually reset the circuit breaker after investigating rollback causes."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized.")
+    engine.circuit_breaker_tripped = False
+    engine.circuit_breaker_tripped_at = None
+    engine.circuit_breaker_reason = ""
+    engine.enabled = engine.rebalance_policy.get("enabled", True)
+    logger.info("Circuit breaker manually reset via API.")
+    return {"status": "reset", "engine_enabled": engine.enabled}
 
 
 # --- Execution Control Endpoints ---

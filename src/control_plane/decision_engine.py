@@ -43,6 +43,16 @@ class DecisionEngine:
         self.max_moves_per_hour = self.rebalance_policy.get("max_volumes_moved_per_hour", 3)
         self.max_concurrent_migrations = self.rebalance_policy.get("max_concurrent_migrations", 1)
 
+        self.circuit_breaker_tripped = False
+        self.circuit_breaker_tripped_at: Optional[pd.Timestamp] = None
+        self.circuit_breaker_reason: str = ""
+        # Read from policy
+        self.max_rollback_rate_pct = self.policy.get("safety_guardrails", {}).get(
+            "max_rollback_rate_pct", 1.0
+        )
+        # Minimum actions before circuit breaker can trip (avoid tripping on first rollback)
+        self._circuit_breaker_min_actions = 10
+
         # State tracking
         self.hotspot_start_times: Dict[str, pd.Timestamp] = {}
         self.action_history: List[Dict[str, Any]] = []
@@ -105,11 +115,47 @@ class DecisionEngine:
             }
         ]
 
+    def _check_circuit_breaker(self, timestamp: pd.Timestamp) -> bool:
+        """
+        Check if rollback rate exceeds policy threshold.
+        Trips the circuit breaker and disables the engine if so.
+        Returns True if circuit breaker is tripped (engine should not act).
+        """
+        if self.circuit_breaker_tripped:
+            return True
+        # Only evaluate after minimum number of actions to avoid false trips
+        if self.monitor.total_actions < self._circuit_breaker_min_actions:
+            return False
+        current_rate = self.monitor.get_rollback_rate()
+        if current_rate > self.max_rollback_rate_pct:
+            self.circuit_breaker_tripped = True
+            self.circuit_breaker_tripped_at = timestamp
+            self.circuit_breaker_reason = (
+                f"Rollback rate {round(current_rate, 2)}% exceeded policy "
+                f"threshold {self.max_rollback_rate_pct}%"
+            )
+            self.enabled = False
+            logger.error(
+                "CIRCUIT BREAKER TRIPPED: %s. Auto-rebalancing DISABLED. "
+                "Reset via PUT /policy with rebalance_policy.enabled=true "
+                "after investigating rollback causes.",
+                self.circuit_breaker_reason
+            )
+        return self.circuit_breaker_tripped
+
     def evaluate_volume(self, volume_id: str, timestamp: pd.Timestamp, inference_results: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Evaluate a single volume's metrics and decide if any action is triggered."""
         if not self.enabled:
             logger.info("Decision engine disabled.")
             return None
+
+        if self._check_circuit_breaker(timestamp):
+            return {
+                "status": "circuit_breaker_tripped",
+                "reason": self.circuit_breaker_reason,
+                "tripped_at": self.circuit_breaker_tripped_at.isoformat()
+                              if self.circuit_breaker_tripped_at else None
+            }
 
         # 1. Perform model inference
         if inference_results is None:

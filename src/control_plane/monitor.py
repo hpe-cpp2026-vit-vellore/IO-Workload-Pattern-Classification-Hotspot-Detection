@@ -120,6 +120,10 @@ class ActionMonitor:
             return 0.0
         return (self.rolled_back_count / self.total_actions) * 100.0
 
+    def check_rollback_rate_exceeded(self, threshold_pct: float) -> bool:
+        """Returns True if the current rollback rate exceeds the threshold."""
+        return self.get_rollback_rate() > threshold_pct
+
     def get_summary(self) -> Dict[str, Any]:
         """Get summary metrics of all rebalance operations."""
         return {
