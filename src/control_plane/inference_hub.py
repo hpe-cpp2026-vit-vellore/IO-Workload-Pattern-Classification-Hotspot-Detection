@@ -76,6 +76,19 @@ class InferenceHub:
         self.classifier = joblib.load(classifier_path)
         self.classifier_scaler = joblib.load(scaler_path)
 
+        # ARF+ADWIN streaming classifier (optional — loaded if artifact exists)
+        arf_path = self.project_root / "models" / "classifier" / "arf_model.pkl"
+        self.arf_classifier = None
+        self._arf_feature_cols = None
+        if arf_path.exists():
+            try:
+                self.arf_classifier = joblib.load(arf_path)
+                # ARF uses the same scaled feature columns as LightGBM
+                self._arf_feature_cols = self.classifier_scaler.feature_names_in_.tolist()
+                logger.info("ARF+ADWIN classifier loaded from %s", arf_path)
+            except Exception as e:
+                logger.warning("Failed to load ARF classifier: %s. Proceeding without it.", e)
+
         # Anomaly Ensemble
         ensemble_path = self.project_root / "models" / "anomaly" / "ensemble" / "models"
         self.ensemble = EnsembleDetector.load(ensemble_path)
@@ -224,6 +237,23 @@ class InferenceHub:
         pred_class = int(self.classifier.predict(features_scaled_df)[0])
         pred_probs = self.classifier.predict_proba(features_scaled_df)[0].tolist()
         workload_type = LABEL_NAMES[pred_class]
+
+        # ARF+ADWIN secondary classification (online streaming model)
+        arf_pred_class = None
+        arf_workload_type = None
+        if self.arf_classifier is not None:
+            try:
+                x_dict = dict(zip(self._arf_feature_cols, features_scaled_df[self._arf_feature_cols].iloc[0].tolist()))
+                arf_pred_raw = self.arf_classifier.predict_one(x_dict)
+                if arf_pred_raw is not None:
+                    arf_pred_class = int(arf_pred_raw)
+                    arf_workload_type = LABEL_NAMES.get(arf_pred_class, "Unknown")
+                # Online learning: update ARF with LightGBM's prediction as pseudo-label
+                # Only update if LightGBM confidence is high (max prob > 0.85)
+                if max(pred_probs) > 0.85:
+                    self.arf_classifier.learn_one(x_dict, pred_class)
+            except Exception as e:
+                logger.debug("ARF inference failed for %s: %s", volume_id, e)
         
         # 2. Ensemble Anomaly Score
         metrics = VolumeMetrics(
@@ -309,6 +339,8 @@ class InferenceHub:
             "timestamp": timestamp.isoformat(),
             "workload_type": workload_type,
             "workload_confidence": pred_probs,
+            "arf_workload_type": arf_workload_type,
+            "arf_agrees_with_lgbm": (arf_pred_class == pred_class) if arf_pred_class is not None else None,
             "hotspot_score": round(float(hotspot_score), 2),
             "noisy_neighbor_victims": noisy_neighbor_victims,
             "days_to_fill": {

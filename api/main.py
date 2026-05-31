@@ -1286,7 +1286,38 @@ def get_volume_workload(id: str):
     return {
         "volume_id": id,
         "workload_type": analysis["workload_type"],
-        "confidence": analysis["workload_confidence"]
+        "confidence": analysis["workload_confidence"],
+        "arf_workload_type": analysis.get("arf_workload_type"),
+        "arf_agrees": analysis.get("arf_agrees_with_lgbm"),
+    }
+
+
+@app.get("/model/drift-status", status_code=status.HTTP_200_OK)
+def get_model_drift_status():
+    """Report ARF availability and its agreement with the LightGBM classifier."""
+    arf_loaded = bool(getattr(hub, "arf_classifier", None) is not None) if hub is not None else False
+    if not arf_loaded:
+        return {
+            "arf_loaded": False,
+            "lgbm_arf_agreement_rate": None,
+            "disagreeing_volumes": [],
+        }
+
+    comparable = []
+    disagreeing_volumes = []
+    for volume_id, analysis in cached_analysis.items():
+        agree = analysis.get("arf_agrees_with_lgbm")
+        if agree is None:
+            continue
+        comparable.append(agree)
+        if agree is False:
+            disagreeing_volumes.append(volume_id)
+
+    agreement_rate = round((sum(1 for item in comparable if item) / len(comparable)) * 100.0, 2) if comparable else 0.0
+    return {
+        "arf_loaded": True,
+        "lgbm_arf_agreement_rate": agreement_rate,
+        "disagreeing_volumes": disagreeing_volumes,
     }
 
 

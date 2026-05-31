@@ -577,11 +577,19 @@ elif selected_page == "Volume Deep Dive":
         display_iops = int(vol_current_iops) if vol_is_live else int(df_metrics['total_iops'].iloc[-1])
         display_latency = vol_current_latency if vol_is_live else float(df_metrics['avg_latency_us'].iloc[-1])
         data_label = "Live" if vol_is_live else "Historical"
+        arf_info_line = ""
+        if workload and workload.get('arf_workload_type') is not None:
+            arf_agrees = workload.get('arf_agrees')
+            arf_info_line = (
+                f"<p><strong>ARF model:</strong> {workload.get('arf_workload_type')}"
+                f" <span style='color:#8b949e;'>(agrees: {'yes' if arf_agrees is True else 'no' if arf_agrees is False else 'n/a'})</span></p>"
+            )
         st.markdown(f"""
         <div class="metric-card" style="height: 250px;">
             <div class="metric-title">Volume Metadata & Details</div>
             <p><strong>Volume ID:</strong> {selected_vol}</p>
             <p><strong>Predicted Classification:</strong> <span style="color:#00f0ff; font-weight:bold;">{workload.get('workload_type') if workload else '—'}</span></p>
+            {arf_info_line}
             <p><strong>Active Tier:</strong> {vol_row['tier']}</p>
             <p><strong>Current IOPS ({data_label}):</strong> {display_iops:,}</p>
             <p><strong>Mean Latency ({data_label}):</strong> {display_latency:.1f} µs</p>
