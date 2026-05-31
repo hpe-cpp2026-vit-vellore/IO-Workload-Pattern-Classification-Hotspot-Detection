@@ -253,9 +253,9 @@ def main() -> None:
     pd.DataFrame(all_snapshots).to_csv(curve_path, index=False)
     print(f"Accuracy curve → {curve_path.relative_to(ROOT)}")
 
-    from joblib import dump
+    # ── Save trained ARF model ────────────────────────────────────────────────
     model_path = MODEL_DIR / "arf_model.pkl"
-    dump(model, model_path)
+    joblib.dump(model, model_path)
     print(f"ARF model serialized → {model_path.relative_to(ROOT)}")
 
     # ── Final summary ─────────────────────────────────────────────────────────

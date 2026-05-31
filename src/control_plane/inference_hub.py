@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
+import logging
 
 # Bootstrap path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -31,6 +32,9 @@ from src.models.anomaly.noisy_neighbor import NoisyNeighborDetector, NoisyNeighb
 from src.models.forecasting.nbeats_model import NBeatsModel, forecast_volume
 from src.models.forecasting.tft_model import TemporalFusionTransformer
 from src.models.forecasting.tft_forecaster import prepare_hourly_latency
+from src.models.forecasting.demand_forecaster import DemandForecaster
+
+logger = logging.getLogger(__name__)
 
 LABEL_NAMES: Dict[int, str] = {
     0: "DB_OLTP",
@@ -135,6 +139,16 @@ class InferenceHub:
         )
         self.tft.load_state_dict(torch.load(tft_path, map_location="cpu"))
         self.tft.eval()
+
+        # Demand forecaster (Quantile regressors per-volume) — optional
+        demand_path = self.project_root / "models" / "forecasting" / "demand_forecaster.pkl"
+        self.demand_forecaster = None
+        if demand_path.exists():
+            try:
+                self.demand_forecaster = DemandForecaster.load(self.project_root / "models" / "forecasting")
+                logger.info("DemandForecaster loaded.")
+            except Exception as e:
+                logger.warning("Failed to load DemandForecaster: %s", e)
 
     def combined_features(self) -> pd.DataFrame:
         """Return historical + live features merged for model queries.
@@ -334,6 +348,14 @@ class InferenceHub:
         # Latency risk score: probability of SLO breach (approximated here by severity)
         latency_risk_score = 1.0 if max_p95 >= 8000.0 else (max_p95 / 8000.0)
 
+        # IOPS and throughput quantile demand forecast
+        demand_forecast_24h = None
+        if self.demand_forecaster is not None:
+            try:
+                demand_forecast_24h = self.demand_forecaster.predict_next_24h(volume_id)
+            except Exception as e:
+                logger.debug("Demand forecast failed for %s: %s", volume_id, e)
+
         return {
             "volume_id": volume_id,
             "timestamp": timestamp.isoformat(),
@@ -352,6 +374,7 @@ class InferenceHub:
                 "p90_latency_us": [round(float(v), 2) for v in p90],
                 "p95_latency_us": [round(float(v), 2) for v in p95]
             },
+            "demand_forecast_24h": demand_forecast_24h,
             "latency_risk_score": round(latency_risk_score, 4)
         }
 

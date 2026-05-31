@@ -1453,8 +1453,24 @@ def get_bandwidth_forecast(volume_id: str = Query(..., description="ID of the vo
         analysis = hub.analyze_volume(volume_id)
     return {
         "volume_id": volume_id,
-        "forecast_24h": analysis["bandwidth_forecast_24h"]
+        "forecast_24h": analysis.get("bandwidth_forecast_24h"),
+        "demand_forecast_24h": analysis.get("demand_forecast_24h"),
     }
+
+
+@app.get("/forecast/demand", status_code=200)
+def get_demand_forecast(volume_id: str = Query(...)):
+    validate_volume(volume_id)
+    analysis = cached_analysis.get(volume_id)
+    if not analysis:
+        analysis = hub.analyze_volume(volume_id)
+    demand = analysis.get("demand_forecast_24h")
+    if demand is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Demand forecaster not loaded. Run scripts/train_all.py first."
+        )
+    return {"volume_id": volume_id, **demand}
 
 
 @app.get("/forecast/dtf", status_code=status.HTTP_200_OK)
