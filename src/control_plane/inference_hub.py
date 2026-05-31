@@ -44,6 +44,64 @@ LABEL_NAMES: Dict[int, str] = {
     4: "AI_Inference",
 }
 
+
+def compute_latency_ttv(
+    p95_forecast: list,
+    slo_threshold_us: float = 8000.0,
+    forecast_interval_hours: float = 1.0,
+) -> Dict[str, Any]:
+    """Compute time-to-violation for a latency SLO from a p95 forecast sequence."""
+    if not p95_forecast:
+        return {
+            "will_breach": False,
+            "hours_to_breach": None,
+            "breach_at_step": None,
+            "max_p95_forecast_us": 0.0,
+            "slo_threshold_us": slo_threshold_us,
+            "current_headroom_us": slo_threshold_us,
+            "risk_level": "none",
+        }
+
+    max_p95 = float(max(p95_forecast))
+    breach_step = None
+    hours_to_breach = None
+
+    for i, val in enumerate(p95_forecast):
+        if val >= slo_threshold_us:
+            breach_step = i
+            # Linear interpolation for sub-step precision
+            if i > 0:
+                prev = p95_forecast[i - 1]
+                frac = (slo_threshold_us - prev) / (val - prev + 1e-9)
+                hours_to_breach = (i - 1 + frac) * forecast_interval_hours
+            else:
+                hours_to_breach = 0.0
+            break
+
+    will_breach = breach_step is not None
+    current_headroom = slo_threshold_us - max_p95
+
+    if not will_breach:
+        risk_level = "none"
+    elif hours_to_breach < 1.0:
+        risk_level = "critical"
+    elif hours_to_breach < 3.0:
+        risk_level = "high"
+    elif hours_to_breach < 5.0:
+        risk_level = "medium"
+    else:
+        risk_level = "low"
+
+    return {
+        "will_breach": will_breach,
+        "hours_to_breach": round(hours_to_breach, 2) if hours_to_breach is not None else None,
+        "breach_at_step": breach_step,
+        "max_p95_forecast_us": round(max_p95, 2),
+        "slo_threshold_us": slo_threshold_us,
+        "current_headroom_us": round(current_headroom, 2),
+        "risk_level": risk_level,
+    }
+
 class InferenceHub:
     """Coordinates workload classification, anomalies, capacity, and latency forecasting."""
 
@@ -355,6 +413,16 @@ class InferenceHub:
         # Latency risk score: probability of SLO breach (approximated here by severity)
         latency_risk_score = 1.0 if max_p95 >= 8000.0 else (max_p95 / 8000.0)
 
+        # Time-to-violation estimate from TFT p95 forecast
+        slo_threshold_us = self.policy.get("capacity_policy", {}).get(
+            "latency_slo_threshold_us", 8000.0
+        )
+        latency_ttv = compute_latency_ttv(
+            p95_forecast=p95.tolist(),
+            slo_threshold_us=slo_threshold_us,
+            forecast_interval_hours=1.0,
+        )
+
         # IOPS and throughput quantile demand forecast
         demand_forecast_24h = None
         if self.demand_forecaster is not None:
@@ -382,6 +450,7 @@ class InferenceHub:
                 "p95_latency_us": [round(float(v), 2) for v in p95]
             },
             "demand_forecast_24h": demand_forecast_24h,
+            "latency_ttv": latency_ttv,
             "latency_risk_score": round(latency_risk_score, 4)
         }
 

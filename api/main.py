@@ -1499,6 +1499,35 @@ def get_dtf_urgency():
     return dtf_list
 
 
+@app.get("/forecast/ttv", status_code=200)
+def get_latency_ttv(volume_id: Optional[str] = Query(None)):
+    """Returns time-to-violation estimates for latency SLOs."""
+    if hub is None:
+        raise HTTPException(status_code=503, detail="Hub not initialized.")
+
+    if volume_id is not None:
+        validate_volume(volume_id)
+        analysis = cached_analysis.get(volume_id) or hub.analyze_volume(volume_id)
+        return {"volume_id": volume_id, **analysis.get("latency_ttv", {})}
+
+    results = []
+    for vol_id, analysis in cached_analysis.items():
+        ttv = analysis.get("latency_ttv", {})
+        results.append({
+            "volume_id": vol_id,
+            "workload_type": analysis.get("workload_type"),
+            **ttv
+        })
+
+    # Sort: critical first, then by hours_to_breach ascending, non-breaching last
+    risk_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
+    results.sort(key=lambda x: (
+        risk_order.get(x.get("risk_level", "none"), 5),
+        x.get("hours_to_breach") if x.get("hours_to_breach") is not None else 9999.0,
+    ))
+    return results
+
+
 @app.get("/cluster/headroom", status_code=200)
 def get_cluster_headroom():
     """Returns tier-level and pool-level capacity headroom for the full cluster."""
@@ -1613,13 +1642,32 @@ def get_recommendations():
                 "message": f"Active hotspot detected (score: {score}) on volume. Severe performance anomaly."
             })
             
-        # 3. Latency Risk SLO breaches
-        risk_score = analysis.get("latency_risk_score", 0.0)
-        if risk_score >= 0.8:
+        # 3. Latency Risk SLO breaches (TTV-aware)
+        ttv = analysis.get("latency_ttv", {})
+        risk_level = ttv.get("risk_level", "none")
+        hours = ttv.get("hours_to_breach")
+        if risk_level == "critical":
             recs.append({
                 "volume_id": vol_id,
-                "priority": "MEDIUM",
-                "message": f"High risk of SLO latency breach (peak probability: {round(risk_score * 100, 1)}%) in next 24h."
+                "priority": "CRITICAL",
+                "message": (
+                    f"Latency SLO breach imminent for {vol_id} "
+                    f"({'<1h' if hours is not None and hours < 1 else 'already breached'}). "
+                    f"Max p95 forecast: {ttv.get('max_p95_forecast_us', 0):.0f}us "
+                    f"(SLO: {ttv.get('slo_threshold_us', 8000):.0f}us). "
+                    f"Immediate QoS shaping or migration required."
+                )
+            })
+        elif risk_level in ("high", "medium") and hours is not None:
+            recs.append({
+                "volume_id": vol_id,
+                "priority": "HIGH" if risk_level == "high" else "MEDIUM",
+                "message": (
+                    f"Latency SLO breach predicted for {vol_id} in "
+                    f"{hours:.1f}h. Max p95 forecast: "
+                    f"{ttv.get('max_p95_forecast_us', 0):.0f}us. "
+                    f"Consider preemptive migration or QoS shaping."
+                )
             })
 
     # 4. Tier headroom warnings

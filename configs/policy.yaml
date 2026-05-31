@@ -23,6 +23,7 @@ capacity_policy:
   critical_threshold_pct: 95
   dtf_warning_days: 30
   dtf_critical_days: 7
+  latency_slo_threshold_us: 8000.0
 
 qos_policy:
   backup_iops_cap: 3000
