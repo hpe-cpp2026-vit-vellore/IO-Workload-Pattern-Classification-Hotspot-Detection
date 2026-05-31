@@ -160,6 +160,13 @@ class InferenceHub:
             return self.features_df
         return pd.concat([self.features_df, self.live_features_df], ignore_index=True)
 
+    def get_cluster_headroom(self) -> Dict[str, Any]:
+        """Returns tier and pool headroom for the full cluster."""
+        return {
+            "tier_headroom": self.topology.get_tier_headroom(),
+            "pool_headroom": self.topology.get_pool_headroom(),
+        }
+
     def get_raw_feature_row(self, volume_id: str, timestamp: pd.Timestamp) -> pd.Series:
         """Extract the exact feature row at timestamp for volume_id."""
         cdf = self.combined_features()

@@ -199,6 +199,114 @@ class TopologyGraph:
             return None
         return min(candidates, key=lambda n: self.get_node_utilization(n)["total_iops"])
 
+    def _normalize_capacity_used_fraction(self, raw_value: Optional[float]) -> Optional[float]:
+        """Normalize capacity-used value into [0.0, 1.0] fraction.
+
+        Accepts either fraction-scale (0.0-1.0) or percent-scale (0-100).
+        """
+        if raw_value is None:
+            return None
+        try:
+            val = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+        if val < 0:
+            return 0.0
+        if val <= 1.0:
+            return val
+        if val <= 100.0:
+            return val / 100.0
+        return 1.0
+
+    def _get_volume_capacity_inputs(self, volume_id: str) -> tuple[Optional[float], Optional[float]]:
+        """Return (capacity_total_gb, used_fraction) for one volume.
+
+        Priority:
+        1) live metrics in self._volume_metrics
+        2) topology node attributes fallback (capacity_gb)
+        """
+        metrics = self._volume_metrics.get(volume_id, {})
+        node_attr = self.graph.nodes.get(volume_id, {})
+
+        total_gb = metrics.get("capacity_total_gb")
+        if total_gb is None:
+            total_gb = node_attr.get("capacity_gb")
+
+        try:
+            total_gb = float(total_gb) if total_gb is not None else None
+        except (TypeError, ValueError):
+            total_gb = None
+
+        used_fraction = self._normalize_capacity_used_fraction(metrics.get("capacity_used_pct"))
+        if used_fraction is None and total_gb not in (None, 0.0):
+            used_gb = metrics.get("capacity_used_gb")
+            try:
+                if used_gb is not None:
+                    used_fraction = max(0.0, min(1.0, float(used_gb) / float(total_gb)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                used_fraction = None
+
+        return total_gb, used_fraction
+
+    def _aggregate_headroom_by(self, key_attr: str, default_key: str) -> Dict[str, Dict[str, float]]:
+        """Aggregate capacity headroom by a volume attribute key (tier/pool)."""
+        buckets: Dict[str, Dict[str, object]] = {}
+
+        for volume_id in self.all_volumes():
+            node_attr = self.graph.nodes.get(volume_id, {})
+            key = node_attr.get(key_attr) or default_key
+            key = str(key)
+
+            if key not in buckets:
+                buckets[key] = {
+                    "total_capacity_gb": 0.0,
+                    "used_capacity_gb": 0.0,
+                    "headroom_gb": 0.0,
+                    "volume_count": 0,
+                    "critical_volumes": [],
+                }
+
+            bucket = buckets[key]
+            bucket["volume_count"] = int(bucket["volume_count"]) + 1
+
+            total_gb, used_fraction = self._get_volume_capacity_inputs(volume_id)
+            if total_gb is not None:
+                used_gb = (used_fraction * total_gb) if used_fraction is not None else 0.0
+                headroom_gb = max(total_gb - used_gb, 0.0)
+
+                bucket["total_capacity_gb"] = float(bucket["total_capacity_gb"]) + float(total_gb)
+                bucket["used_capacity_gb"] = float(bucket["used_capacity_gb"]) + float(used_gb)
+                bucket["headroom_gb"] = float(bucket["headroom_gb"]) + float(headroom_gb)
+
+            if used_fraction is not None and used_fraction >= 0.90:
+                bucket["critical_volumes"].append(volume_id)
+
+        result: Dict[str, Dict[str, float]] = {}
+        for key, info in buckets.items():
+            total_capacity = float(info["total_capacity_gb"])
+            used_capacity = float(info["used_capacity_gb"])
+            used_pct = (used_capacity / total_capacity * 100.0) if total_capacity > 0.0 else 0.0
+
+            result[key] = {
+                "total_capacity_gb": round(total_capacity, 2),
+                "used_capacity_gb": round(used_capacity, 2),
+                "used_pct": round(used_pct, 2),
+                "headroom_gb": round(float(info["headroom_gb"]), 2),
+                "volume_count": int(info["volume_count"]),
+                "critical_volumes": sorted(info["critical_volumes"]),
+            }
+
+        return result
+
+    def get_tier_headroom(self) -> Dict[str, Dict[str, float]]:
+        """Return per-tier capacity summary aggregated from all volumes."""
+        return self._aggregate_headroom_by(key_attr="tier", default_key="Unknown")
+
+    def get_pool_headroom(self) -> Dict[str, Dict[str, float]]:
+        """Return per-pool capacity summary aggregated from all volumes."""
+        return self._aggregate_headroom_by(key_attr="pool_id", default_key="Unknown")
+
     # ────────────────────────────────────────────────────────────────────
     # Live updates
     # ────────────────────────────────────────────────────────────────────

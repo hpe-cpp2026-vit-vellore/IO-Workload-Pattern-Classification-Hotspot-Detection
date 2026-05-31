@@ -1499,6 +1499,30 @@ def get_dtf_urgency():
     return dtf_list
 
 
+@app.get("/cluster/headroom", status_code=200)
+def get_cluster_headroom():
+    """Returns tier-level and pool-level capacity headroom for the full cluster."""
+    if hub is None:
+        raise HTTPException(status_code=503, detail="Hub not initialized.")
+    # Sync latest live metrics into topology before computing headroom
+    sync_topology_from_redis()
+    return hub.get_cluster_headroom()
+
+
+@app.get("/cluster/headroom/tier/{tier_name}", status_code=200)
+def get_tier_headroom(tier_name: str):
+    if hub is None:
+        raise HTTPException(status_code=503, detail="Hub not initialized.")
+    sync_topology_from_redis()
+    headroom = hub.topology.get_tier_headroom()
+    if tier_name not in headroom:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tier '{tier_name}' not found. Available: {list(headroom.keys())}"
+        )
+    return {"tier": tier_name, **headroom[tier_name]}
+
+
 # --- What-If Simulator Endpoints ---
 
 @app.post("/simulate/capacity", status_code=status.HTTP_200_OK)
@@ -1597,6 +1621,34 @@ def get_recommendations():
                 "priority": "MEDIUM",
                 "message": f"High risk of SLO latency breach (peak probability: {round(risk_score * 100, 1)}%) in next 24h."
             })
+
+    # 4. Tier headroom warnings
+    try:
+        tier_headroom = hub.topology.get_tier_headroom()
+        for tier_name, info in tier_headroom.items():
+            used_pct = info.get("used_pct", 0.0)
+            headroom_gb = info.get("headroom_gb", 0.0)
+            if used_pct >= 90.0:
+                recs.append({
+                    "volume_id": "CLUSTER",
+                    "priority": "CRITICAL",
+                    "message": (
+                        f"{tier_name} storage tier is {round(used_pct, 1)}% full "
+                        f"({round(headroom_gb, 0)} GB remaining). "
+                        f"Immediately add capacity or migrate volumes to other tiers."
+                    )
+                })
+            elif used_pct >= 80.0:
+                recs.append({
+                    "volume_id": "CLUSTER",
+                    "priority": "WARNING",
+                    "message": (
+                        f"{tier_name} storage tier is {round(used_pct, 1)}% full "
+                        f"({round(headroom_gb, 0)} GB remaining). Plan capacity expansion."
+                    )
+                })
+    except Exception as e:
+        logger.error("Tier headroom recommendation failed: %s", e)
             
     # Sort recommendations: CRITICAL -> HIGH -> WARNING -> MEDIUM
     prio_order = {"CRITICAL": 0, "HIGH": 1, "WARNING": 2, "MEDIUM": 3}
