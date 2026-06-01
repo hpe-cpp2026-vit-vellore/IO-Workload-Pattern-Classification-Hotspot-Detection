@@ -11,10 +11,14 @@ Pipeline Steps:
 4. LightGBM Baseline     → models/classifier/lightgbm_model.pkl
 5. LightGBM Tuned        → models/classifier/lightgbm_tuned_model.pkl
 6. ARF+ADWIN             → models/classifier/arf_model.pkl
-7. Anomaly Detection     → models/anomaly/ensemble/models/
-8. N-BEATS Forecasting   → models/forecasting/nbeats_model.pth
-9. TFT Forecasting       → models/forecasting/tft_model.pth
-10. Demand Forecasting    → models/forecasting/demand_forecaster.pkl
+7. Statistical Anomaly   → models/anomaly/statistical_detector_scores.csv
+8. Isolation Forest      → models/anomaly/isolation_forest_scores.csv
+9. LSTM Autoencoder      → models/anomaly/lstm_ae_scores.csv
+10. Ensemble Detector    → models/anomaly/ensemble/models/ensemble_config.json
+11. Evaluate Detectors   → models/anomaly/statistical_detector_scores.csv
+12. N-BEATS Forecasting  → models/forecasting/nbeats_model.pth
+13. TFT Forecasting      → models/forecasting/tft_model.pth
+14. Demand Forecasting   → models/forecasting/demand_forecaster.pkl
 
 Usage:
     python scripts/train_all.py                    # Full pipeline
@@ -80,27 +84,55 @@ PIPELINE_STEPS = [
     },
     {
         "id": 7,
-        "name": "Anomaly Detection Ensemble",
-        "script": "src/models/anomaly/evaluate_all_detectors.py",
+        "name": "Statistical Anomaly Detector",
+        "script": "src/models/anomaly/statistical_detector.py",
         "output": "models/anomaly/statistical_detector_scores.csv",
-        "description": "Train and evaluate all anomaly detectors",
+        "description": "Train statistical hotspot detector and generate per-volume scores",
     },
     {
         "id": 8,
+        "name": "Isolation Forest Detector",
+        "script": "src/models/anomaly/isolation_forest.py",
+        "output": "models/anomaly/isolation_forest_scores.csv",
+        "description": "Train Isolation Forest and generate anomaly scores",
+    },
+    {
+        "id": 9,
+        "name": "LSTM Autoencoder",
+        "script": "src/models/anomaly/lstm_autoencoder.py",
+        "output": "models/anomaly/lstm_ae_scores.csv",
+        "description": "Train LSTM Autoencoder and generate reconstruction error scores",
+    },
+    {
+        "id": 10,
+        "name": "Anomaly Detection Ensemble",
+        "script": "src/models/anomaly/ensemble_detector.py",
+        "output": "models/anomaly/ensemble/models/ensemble_config.json",
+        "description": "Train ensemble fusion of all three detectors and save to ensemble/models/",
+    },
+    {
+        "id": 11,
+        "name": "Evaluate Anomaly Detectors",
+        "script": "src/models/anomaly/evaluate_all_detectors.py",
+        "output": "models/anomaly/statistical_detector_scores.csv",
+        "description": "Cross-evaluate all detectors against 3-sigma ground truth",
+    },
+    {
+        "id": 12,
         "name": "N-BEATS Capacity Forecasting",
         "script": "src/models/forecasting/dtf_forecaster.py",
         "output": "models/forecasting/nbeats_model.pth",
         "description": "Days-to-Fill (DTF) capacity forecasting with N-BEATS",
     },
     {
-        "id": 9,
+        "id": 13,
         "name": "TFT Latency Forecasting",
         "script": "src/models/forecasting/tft_forecaster.py",
         "output": "models/forecasting/tft_model.pth",
         "description": "Temporal Fusion Transformer for tail latency risk prediction",
     },
     {
-        "id": 10,
+        "id": 14,
         "name": "Demand Forecasting",
         "script": "src/models/forecasting/demand_forecaster.py",
         "output": "models/forecasting/demand_forecaster.pkl",
@@ -253,7 +285,7 @@ def print_summary(completed_steps: List[dict], failed_step: Optional[dict]) -> N
     
     if failed_step:
         print(f"\n💡 To resume from step {failed_step['id']}, run:")
-        print(f"   python scripts/train_all.py --steps {failed_step['id']}-9")
+        print(f"   python scripts/train_all.py --steps {failed_step['id']}-14")
     else:
         print("\n🎉 All models trained successfully!")
         print("   Next steps:")
@@ -292,8 +324,8 @@ Examples:
   python scripts/train_all.py                    # Run full pipeline
   python scripts/train_all.py --skip-data        # Skip data generation
   python scripts/train_all.py --steps 4,5,6      # Run only steps 4, 5, 6
-  python scripts/train_all.py --steps 4-9        # Run steps 4 through 9
-    python scripts/train_all.py --steps 10         # Run demand forecasting only
+  python scripts/train_all.py --steps 4-14       # Run steps 4 through 14
+  python scripts/train_all.py --steps 14         # Run demand forecasting only
         """,
     )
     parser.add_argument(
