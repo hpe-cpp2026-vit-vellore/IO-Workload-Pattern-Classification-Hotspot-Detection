@@ -28,7 +28,10 @@ LIB_DEST_PATH = PROJECT_ROOT / "models" / f"telemetry_parser{LIB_EXT}"
 
 _cpp_lib = None
 _cached_bounds = None
-CPP_AVAILABLE = False
+# Path to compiled C++ binary (present in Docker, absent in local venv dev)
+_CPP_PARSER_BIN = PROJECT_ROOT / "bin" / "telemetry_parser"
+_CPP_PARSER_AVAILABLE = _CPP_PARSER_BIN.exists() and os.access(_CPP_PARSER_BIN, os.X_OK)
+CPP_AVAILABLE = _CPP_PARSER_AVAILABLE
 
 
 def load_or_create_bounds(project_root: Path = PROJECT_ROOT) -> Dict[str, Any]:
@@ -266,7 +269,7 @@ def python_fallback_parse_and_clip(json_str: str, bounds: Dict[str, Any]) -> Dic
     return data
 
 
-def parse_and_clip(json_str: str, bounds: Dict[str, Any]) -> Dict[str, Any]:
+def _python_parse_and_clip(json_str: str, bounds: Dict[str, Any]) -> Dict[str, Any]:
     """
     Parses a telemetry event JSON string and clips numerical outliers.
     Uses C++ library if available, else falls back gracefully to Python.
@@ -308,6 +311,39 @@ def parse_and_clip(json_str: str, bounds: Dict[str, Any]) -> Dict[str, Any]:
 
     # Graceful fallback
     return python_fallback_parse_and_clip(json_str, bounds)
+
+
+def _cpp_parse_and_clip(raw_line: str, bounds: dict) -> dict:
+    """
+    Invoke compiled C++ parser. The binary reads JSON from stdin and 
+    writes clipped JSON to stdout. Bounds are passed as a JSON string 
+    via the --bounds flag.
+    Falls back to Python parser on any subprocess error.
+    """
+    try:
+        result = subprocess.run(
+            [str(_CPP_PARSER_BIN), "--bounds", json.dumps(bounds)],
+            input=raw_line,
+            capture_output=True,
+            text=True,
+            timeout=0.1,   # 100ms max — must be fast for real-time pipeline
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+    except Exception:
+        pass
+    # Fall back to Python on any failure
+    return _python_parse_and_clip(raw_line, bounds)
+
+
+def parse_and_clip(raw_line: str, bounds: dict) -> dict:
+    """
+    Parse a raw JSON telemetry line and clip outlier values to bounds.
+    Uses compiled C++ binary when available (Docker), Python fallback otherwise.
+    """
+    if _CPP_PARSER_AVAILABLE:
+        return _cpp_parse_and_clip(raw_line, bounds)
+    return _python_parse_and_clip(raw_line, bounds)
 
 
 # Initialize on import

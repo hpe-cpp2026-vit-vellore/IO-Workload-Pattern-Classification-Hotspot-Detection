@@ -1,4 +1,3 @@
-import pytest
 from src.pipeline.topology_graph import TopologyGraph
 from src.control_plane.rebalancer import Rebalancer
 

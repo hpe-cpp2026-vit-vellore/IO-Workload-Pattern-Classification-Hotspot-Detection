@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Build tools are only needed here for native extensions.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential gcc g++ \
+        build-essential gcc g++ nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -24,6 +24,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --index-url https://download.pytorch.org/whl/cpu \
         --extra-index-url https://pypi.org/simple \
         torch
+
+# Compile C++ telemetry parser
+WORKDIR /build/cpp
+COPY src/cpp/telemetry_parser.cpp .
+RUN g++ -O2 -std=c++17 -I/usr/include -o telemetry_parser telemetry_parser.cpp \
+    && strip telemetry_parser
 
 # Runtime stage: slim image with only runtime deps and app code.
 FROM python:3.11-slim AS runtime
@@ -43,8 +49,14 @@ RUN useradd -r -m -u 10001 appuser
 
 WORKDIR /app
 
+# Ensure bin directory exists
+RUN mkdir -p /app/bin
+
 COPY --from=builder /install /usr/local
 COPY --chown=appuser:appuser . /app
+
+# Copy compiled binary
+COPY --from=builder --chown=appuser:appuser /build/cpp/telemetry_parser /app/bin/telemetry_parser
 
 USER appuser
 
