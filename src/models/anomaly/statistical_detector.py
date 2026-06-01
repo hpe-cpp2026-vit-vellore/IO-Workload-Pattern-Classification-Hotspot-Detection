@@ -53,6 +53,10 @@ class HotspotAlert:
     triggered_metrics: List[str]
     details: Dict[str, float]
 
+    @property
+    def score(self) -> float:
+        return self.hotspot_score
+
 
 class StatisticalHotspotDetector:
     """
@@ -105,6 +109,15 @@ class StatisticalHotspotDetector:
         self.total_detections = 0
         self.detections_per_volume: Dict[str, int] = defaultdict(int)
     
+    def update(self, volume_id: str, metrics: VolumeMetrics) -> HotspotAlert | None:
+        """
+        Runs detect_hotspot and updates the baseline.
+        Returns the HotspotAlert if triggered, else None.
+        """
+        score, alert = self.detect_hotspot(volume_id, metrics)
+        self.update_baseline(volume_id, metrics)
+        return alert
+
     def update_baseline(self, volume_id: str, metrics: VolumeMetrics) -> None:
         """
         Update rolling baseline with new metrics.

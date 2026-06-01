@@ -176,6 +176,7 @@ tcp_server: Optional[Any] = None
 
 # Rate limiting for volume analyses (in seconds)
 last_analyzed_time: Dict[str, float] = {}
+fast_hotspot_scores: Dict[str, float] = {}
 analysis_tasks: Dict[str, asyncio.Task] = {}
 
 class LiveTelemetryState:
@@ -439,7 +440,7 @@ async def redis_stream_listener():
 
     Automatically reconnects when the WSL2 NAT layer drops the connection.
     """
-    global r, active_streams
+    global r, active_streams, fast_hotspot_scores
     last_id = "$"
     STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
     consecutive_errors = 0
@@ -483,6 +484,11 @@ async def redis_stream_listener():
                         live_state.record(event)
                         if hub is not None:
                             hub.topology.update_volume_metrics(volume_id, event)
+                            try:
+                                fast_score = hub.fast_hotspot_score(volume_id, event["timestamp"])
+                                fast_hotspot_scores[volume_id] = fast_score
+                            except Exception:
+                                pass
                         if volume_id in active_streams:
                             payload = {
                                 "timestamp": str(timestamp_str),
@@ -581,7 +587,7 @@ def _schedule_volume_analysis(volume_id: str, ts: pd.Timestamp) -> None:
 
 async def handle_tcp_client(reader, writer):
     """TCP Handler for playback agent streaming metrics directly to FastAPI when Redis is offline."""
-    global hub, cached_analysis, active_streams, last_analyzed_time, bounds
+    global hub, cached_analysis, active_streams, last_analyzed_time, bounds, fast_hotspot_scores
     
     # Columns that should remain as strings
     STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
@@ -629,6 +635,14 @@ async def handle_tcp_client(reader, writer):
                     
                     # Update topology metrics
                     hub.topology.update_volume_metrics(volume_id, event)
+                    
+                    # FAST PATH: update statistical detector on every event
+                    if hub is not None:
+                        try:
+                            fast_score = hub.fast_hotspot_score(volume_id, ts)
+                            fast_hotspot_scores[volume_id] = fast_score
+                        except Exception:
+                            pass
                     
                     # Push to SSE streams
                     if volume_id in active_streams:
@@ -1210,6 +1224,7 @@ def get_volumes():
         result.append({
             "volume_id": vol_id,
             "hotspot_score": analysis["hotspot_score"],
+            "fast_hotspot_score": fast_hotspot_scores.get(vol_id),
             "workload_type": analysis["workload_type"],
             "tier": tier,
             "capacity_used_pct": analysis["days_to_fill"].get("capacity_used_pct", 50.0),
@@ -1401,7 +1416,15 @@ def get_alerts():
     """All active alerts sorted by severity."""
     alerts = []
     for vol_id, analysis in cached_analysis.items():
-        score = analysis["hotspot_score"]
+        # Prefer fast real-time statistical score when live telemetry is active,
+        # fall back to full ensemble score from cached analysis
+        live_fast_score = fast_hotspot_scores.get(vol_id)
+        if live_fast_score is not None and live_state.events_received > 0:
+            # Blend: 60% fast live score, 40% full ensemble for stability
+            score = round(0.6 * live_fast_score + 0.4 * analysis["hotspot_score"], 2)
+        else:
+            score = analysis["hotspot_score"]
+            
         if score >= 40:
             severity = "Normal"
             if 40 <= score < 60:

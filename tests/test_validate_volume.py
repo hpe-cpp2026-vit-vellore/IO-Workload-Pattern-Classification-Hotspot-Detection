@@ -97,5 +97,51 @@ class TestValidateVolume(unittest.TestCase):
             api_main.validate_volume("nonexistent_vol_12345")
         self.assertEqual(ctx.exception.status_code, 404)
 
+    def test_fast_hotspot_score(self):
+        """Verify that fast_hotspot_score calculates score and updates baseline."""
+        hub = api_main.hub
+        self.assertIsNotNone(hub)
+        
+        vol_id = hub.features_df["volume_id"].iloc[0]
+        ts = hub.features_df["timestamp"].max()
+        
+        # Call fast_hotspot_score
+        score = hub.fast_hotspot_score(vol_id, ts)
+        self.assertIsInstance(score, float)
+        self.assertTrue(0.0 <= score <= 100.0)
+
+    def test_split_throttle_endpoints(self):
+        """Verify GET /volumes and GET /alerts use the fast path scores."""
+        vol_id = api_main.hub.features_df["volume_id"].iloc[0]
+        api_main.fast_hotspot_scores[vol_id] = 75.0
+        
+        # Test GET /volumes
+        vols = api_main.get_volumes()
+        self.assertGreater(len(vols), 0)
+        found_vol = next((v for v in vols if v["volume_id"] == vol_id), None)
+        self.assertIsNotNone(found_vol)
+        self.assertEqual(found_vol["fast_hotspot_score"], 75.0)
+        
+        # Test GET /alerts blend logic
+        # 1. No events received yet: should fallback to historical score
+        api_main.live_state.events_received = 0
+        alerts = api_main.get_alerts()
+        self.assertIsInstance(alerts, list)
+        
+        # 2. Events received (live mode active): should blend
+        api_main.live_state.events_received = 5
+        # Set historical cached score in cached_analysis for vol_id to 50
+        api_main.cached_analysis[vol_id] = {
+            "hotspot_score": 50.0,
+            "workload_type": "DB_OLTP",
+            "timestamp": "2026-06-01T12:00:00"
+        }
+        
+        alerts = api_main.get_alerts()
+        found_alert = next((a for a in alerts if a["volume_id"] == vol_id), None)
+        if found_alert:
+            # Expected blended score: 0.6 * 75.0 + 0.4 * 50.0 = 45.0 + 20.0 = 65.0
+            self.assertEqual(found_alert["hotspot_score"], 65.0)
+
 if __name__ == "__main__":
     unittest.main()

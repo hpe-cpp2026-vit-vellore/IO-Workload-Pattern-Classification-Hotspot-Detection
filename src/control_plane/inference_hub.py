@@ -222,6 +222,35 @@ class InferenceHub:
         ids.update(self.topology.all_volumes())
         return ids
 
+    def fast_hotspot_score(
+        self, 
+        volume_id: str, 
+        timestamp: pd.Timestamp
+    ) -> float:
+        """
+        Runs only the StatisticalHotspotDetector for immediate hotspot scoring.
+        Sub-millisecond. Safe to call on every telemetry event.
+        Returns the statistical hotspot score [0-100] or 0.0 on failure.
+        """
+        try:
+            row = self.get_raw_feature_row(volume_id, timestamp)
+            from src.models.anomaly.ensemble_detector import VolumeMetrics
+            metrics = VolumeMetrics(
+                timestamp=timestamp,
+                total_iops=float(row["total_iops"]),
+                avg_latency_us=float(row["avg_latency_us"]),
+                total_throughput_mbps=float(row["total_throughput_mbps"]),
+                read_latency_p99_us=float(row["read_latency_p99_us"]),
+                write_latency_p99_us=float(row["write_latency_p99_us"]),
+                capacity_used_pct=float(row.get("capacity_used_pct", 0.0)),
+            )
+            stat_alert = self.ensemble.stat_detector.update(volume_id, metrics)
+            if stat_alert is not None:
+                return float(min(stat_alert.score, 100.0))
+            return 0.0
+        except Exception:
+            return 0.0
+
     def combined_features(self) -> pd.DataFrame:
         """Return historical + live features merged for model queries.
 
