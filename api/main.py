@@ -58,13 +58,37 @@ app = FastAPI(
 )
 
 # Configure CORS
+import os
+
+def _get_allowed_origins() -> list:
+    """
+    Read CORS allowed origins from CORS_ORIGINS environment variable.
+    Format: comma-separated list of origins, e.g.:
+      CORS_ORIGINS=http://localhost:8501,http://127.0.0.1:8501
+    If CORS_ORIGINS=* or the variable is not set, defaults to wildcard 
+    (appropriate for local development only).
+    """
+    raw = os.environ.get("CORS_ORIGINS", "*").strip()
+    if raw == "*":
+        return ["*"]
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    return origins if origins else ["*"]
+
+_cors_origins = _get_allowed_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Log the effective CORS configuration at startup so it is visible in logs
+import logging as _stdlib_logging
+_stdlib_logging.getLogger("api.main").info(
+    "CORS configured with origins: %s", _cors_origins
+)
+
 
 try:
     import redis

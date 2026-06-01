@@ -23,6 +23,22 @@ Redis is optional for local demos. If no Redis server is running on `127.0.0.1:6
 venv\Scripts\python.exe -m src.pipeline.stream_worker
 ```
 
+### CORS Configuration
+For local development, CORS defaults to allow all origins (*).
+For production or shared deployments, set the CORS_ORIGINS environment variable before starting the API:
+
+On Windows (PowerShell):
+```powershell
+$env:CORS_ORIGINS = "http://localhost:8501,http://your-dashboard-host:8501"
+venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+On Linux/macOS:
+```bash
+CORS_ORIGINS="http://localhost:8501" python -m uvicorn api.main:app \
+    --host 127.0.0.1 --port 8000
+```
+
 ## Docker Notes
 
 The Docker setup bind-mounts the `models/` directory at runtime and does not bake model artifacts into the image. On a fresh clone, `docker compose up` will fail until the trained artifacts are present (for example, `models/anomaly/ensemble/lstm_ae_model.pth` and related ensemble stats/config). Run the training pipeline first or place the prebuilt artifacts into `models/` before starting the containers.
