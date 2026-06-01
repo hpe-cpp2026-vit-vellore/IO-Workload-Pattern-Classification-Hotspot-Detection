@@ -35,6 +35,7 @@ if str(ANOMALY_DIR) not in sys.path:
     sys.path.insert(0, str(ANOMALY_DIR))
 
 from src.control_plane import InferenceHub, Rebalancer, ActionMonitor, DecisionEngine, WhatIfSimulator
+from src.control_plane.inference_hub import LABEL_NAMES
 from src.pipeline.telemetry_parser import parse_and_clip, load_or_create_bounds
 from api.schemas.models import (
     SimulateCapacityRequest,
@@ -1363,13 +1364,13 @@ def get_volume_explanation(id: str):
         reasons.append(f"{r['feature']} is {direction} (contribution: {round(r['shap_value'], 3)})")
         
     explanation_text = (
-        f"Volume '{id}' classified as '{InferenceHub.analyze_volume.__globals__['LABEL_NAMES'][pred_class]}' "
+        f"Volume '{id}' classified as '{LABEL_NAMES[pred_class]}' "
         f"primarily because: " + ", ".join(reasons)
     )
     
     return {
         "volume_id": id,
-        "predicted_class": InferenceHub.analyze_volume.__globals__["LABEL_NAMES"][pred_class],
+        "predicted_class": LABEL_NAMES[pred_class],
         "explanation": explanation_text,
         "feature_contributions": contribs
     }
