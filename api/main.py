@@ -267,69 +267,64 @@ class LiveTelemetryState:
             "last_received_at": self.last_received_at.isoformat() if self.last_received_at is not None else None,
         }
 
-class RedisBackedCache(dict):
-    """Custom dictionary that dynamically reads live analysis data from Redis, falling back to local memory."""
-    _redis_error_logged_at: float = 0.0  # rate-limit Redis error logging
+import threading
 
-    def __getitem__(self, key):
-        global use_redis, r, hub
-        if use_redis and r is not None:
-            try:
-                data = r.hget(f"volume:{key}:analysis", "data")
-                if data:
-                    return json.loads(data)
-            except Exception as e:
-                # Rate-limit error logging to once every 30 seconds
-                now = time.time()
-                if now - RedisBackedCache._redis_error_logged_at > 30.0:
-                    logger.warning("Redis cache read failing (will retry silently): %s", e)
-                    RedisBackedCache._redis_error_logged_at = now
-        try:
-            return super().__getitem__(key)
-        except KeyError:
-            if hub is not None:
-                val = hub.analyze_volume(key)
-                super().__setitem__(key, val)
-                return val
-            raise
+class AnalysisCache:
+    """
+    Thread-safe TTL cache for per-volume analysis results.
+    
+    - Reads return the last known value immediately (never blocks on inference).
+    - Staleness is tracked but does not block reads.
+    - Background refresh is handled by _schedule_volume_analysis() as before.
+    """
+    def __init__(self, ttl_seconds: float = 60.0):
+        self._data: Dict[str, Any] = {}
+        self._timestamps: Dict[str, float] = {}
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
 
-    def get(self, key, default=None):
-        try:
-            return self[key]
-        except KeyError:
-            return default
+    def get(self, key: str, default=None):
+        with self._lock:
+            return self._data.get(key, default)
+
+    def __getitem__(self, key: str):
+        with self._lock:
+            if key not in self._data:
+                raise KeyError(key)
+            return self._data[key]
+
+    def __setitem__(self, key: str, value: Any):
+        with self._lock:
+            self._data[key] = value
+            self._timestamps[key] = time.time()
+
+    def __contains__(self, key: str):
+        with self._lock:
+            return key in self._data
+
+    def is_stale(self, key: str) -> bool:
+        with self._lock:
+            ts = self._timestamps.get(key, 0.0)
+            return (time.time() - ts) > self._ttl
 
     def items(self):
-        if hub is not None:
-            all_vols = hub.features_df["volume_id"].unique()
-        else:
-            all_vols = super().keys()
-        return [(v, self[v]) for v in all_vols]
+        with self._lock:
+            return list(self._data.items())
 
-    def values(self):
-        if hub is not None:
-            all_vols = hub.features_df["volume_id"].unique()
-        else:
-            all_vols = super().keys()
-        return [self[v] for v in all_vols]
-
-    def __contains__(self, key):
-        if hub is not None:
-            return key in hub.features_df["volume_id"].unique()
-        return super().__contains__(key)
+    def keys(self):
+        with self._lock:
+            return list(self._data.keys())
 
     def __iter__(self):
-        if hub is not None:
-            return iter(hub.features_df["volume_id"].unique())
-        return super().__iter__()
+        with self._lock:
+            return iter(list(self._data.keys()))
 
     def __len__(self):
-        if hub is not None:
-            return len(hub.features_df["volume_id"].unique())
-        return super().__len__()
+        with self._lock:
+            return len(self._data)
 
 # In-memory cache for live telemetry state (warmup)
-cached_analysis = RedisBackedCache()
+cached_analysis = AnalysisCache(ttl_seconds=60.0)
 live_state = LiveTelemetryState()
 
 def sync_topology_from_redis():
@@ -583,7 +578,11 @@ def _schedule_volume_analysis(volume_id: str, ts: pd.Timestamp) -> None:
         return
 
     last_analyzed_time[volume_id] = now
-    analysis_tasks[volume_id] = asyncio.create_task(_analyze_and_cache_volume(volume_id, ts))
+    try:
+        analysis_tasks[volume_id] = asyncio.create_task(_analyze_and_cache_volume(volume_id, ts))
+    except RuntimeError:
+        # Fallback when there is no running event loop (e.g. during synchronous unit tests)
+        pass
 
 async def handle_tcp_client(reader, writer):
     """TCP Handler for playback agent streaming metrics directly to FastAPI when Redis is offline."""
@@ -1196,31 +1195,55 @@ def get_kpi():
 def get_volumes():
     """Get all 50 volumes in the storage pool with their current status and hotspot scores."""
     result = []
-    for vol_id, analysis in cached_analysis.items():
-        # Get active tier
+    all_vols = hub.known_volumes() if hub is not None else set()
+    for vol_id in sorted(all_vols):
+        analysis = cached_analysis.get(vol_id)
+        is_pending = analysis is None
+        
+        # Schedule a refresh if stale or missing (non-blocking)
+        if analysis is None or cached_analysis.is_stale(vol_id):
+            latest_ts = hub.features_df["timestamp"].max() \
+                        if hub is not None else pd.Timestamp.now()
+            _schedule_volume_analysis(vol_id, latest_ts)
+        
+        if is_pending:
+            # Return a skeleton entry for volumes not yet analyzed
+            result.append({
+                "volume_id": vol_id,
+                "hotspot_score": None,
+                "fast_hotspot_score": fast_hotspot_scores.get(vol_id),
+                "workload_type": "pending",
+                "tier": "unknown",
+                "capacity_used_pct": None,
+                "latency_risk_score": None,
+                "current_iops": None,
+                "current_latency_us": None,
+                "last_seen_timestamp": None,
+                "is_live": False,
+                "analysis_pending": True,
+            })
+            continue
+        
+        # Existing enrichment logic unchanged from here
         tier = "HDD"
         if hub.topology.graph.has_node(vol_id):
             tier = hub.topology.graph.nodes[vol_id].get("tier", "HDD")
-
-        # Enrich with live telemetry when available
         live_event = live_state.latest_by_volume.get(vol_id)
         if live_event is not None:
             current_iops = float(live_event.get("total_iops", 0.0) or 0.0)
             current_latency = float(live_event.get("avg_latency_us", 0.0) or 0.0)
             last_seen_ts = live_event.get("timestamp")
-            last_seen = last_seen_ts.isoformat() if isinstance(last_seen_ts, pd.Timestamp) else str(last_seen_ts)
+            last_seen = last_seen_ts.isoformat() \
+                        if isinstance(last_seen_ts, pd.Timestamp) else str(last_seen_ts)
             vol_is_live = True
         else:
             current_iops = 0.0
             current_latency = 0.0
             last_seen = analysis.get("timestamp")
             vol_is_live = False
-
-        # Include analysis freshness so dashboard can judge hotspot score age
-        analysis_ts = analysis.get("timestamp")
+        
         last_analyzed = last_analyzed_time.get(vol_id, 0.0)
         analysis_age_s = round(time.time() - last_analyzed, 1) if last_analyzed > 0 else None
-
         result.append({
             "volume_id": vol_id,
             "hotspot_score": analysis["hotspot_score"],
@@ -1233,8 +1256,9 @@ def get_volumes():
             "current_latency_us": round(current_latency, 2),
             "last_seen_timestamp": last_seen,
             "is_live": vol_is_live,
-            "last_analyzed_timestamp": analysis_ts,
+            "last_analyzed_timestamp": analysis.get("timestamp"),
             "analysis_freshness_s": analysis_age_s,
+            "analysis_pending": False,
         })
     return result
 
@@ -1342,6 +1366,8 @@ def get_model_drift_status():
     comparable = []
     disagreeing_volumes = []
     for volume_id, analysis in cached_analysis.items():
+        if analysis is None:
+            continue
         agree = analysis.get("arf_agrees_with_lgbm")
         if agree is None:
             continue
@@ -1416,6 +1442,8 @@ def get_alerts():
     """All active alerts sorted by severity."""
     alerts = []
     for vol_id, analysis in cached_analysis.items():
+        if analysis is None:
+            continue
         # Prefer fast real-time statistical score when live telemetry is active,
         # fall back to full ensemble score from cached analysis
         live_fast_score = fast_hotspot_scores.get(vol_id)
@@ -1460,6 +1488,8 @@ def get_noisy_neighbors():
     """Returns detected noisy neighbor relationships across all nodes."""
     noisy_pairs = []
     for vol_id, analysis in cached_analysis.items():
+        if analysis is None:
+            continue
         victims = analysis.get("noisy_neighbor_victims", {})
         if victims:
             noisy_pairs.append({
@@ -1479,6 +1509,8 @@ def get_capacity_forecasts():
     """Retrieve Days-to-Fill (DTF) forecasts and predictions for the storage pool."""
     forecasts = []
     for vol_id, analysis in cached_analysis.items():
+        if analysis is None:
+            continue
         dtf = analysis.get("days_to_fill", {})
         forecasts.append({
             "volume_id": vol_id,
@@ -1522,6 +1554,8 @@ def get_dtf_urgency():
     """All volumes DTF sorted by urgency (most urgent capacity limits first)."""
     dtf_list = []
     for vol_id, analysis in cached_analysis.items():
+        if analysis is None:
+            continue
         dtf = analysis.get("days_to_fill", {})
         crit_days = dtf.get("critical_95pct_days")
         warn_days = dtf.get("warning_85pct_days")
@@ -1556,6 +1590,8 @@ def get_latency_ttv(volume_id: Optional[str] = Query(None)):
 
     results = []
     for vol_id, analysis in cached_analysis.items():
+        if analysis is None:
+            continue
         ttv = analysis.get("latency_ttv", {})
         results.append({
             "volume_id": vol_id,
@@ -1659,6 +1695,8 @@ def get_recommendations():
     recs = []
     
     for vol_id, analysis in cached_analysis.items():
+        if analysis is None:
+            continue
         # 1. Capacity warnings
         dtf = analysis.get("days_to_fill", {})
         crit_days = dtf.get("critical_95pct_days")
