@@ -104,6 +104,7 @@ class StatisticalHotspotDetector:
         
         # Per-volume baseline statistics (cached for performance)
         self.baselines: Dict[str, Dict[str, Tuple[float, float]]] = {}
+        self.last_timestamp: Dict[str, pd.Timestamp] = {}
         
         # Detection counters
         self.total_detections = 0
@@ -129,6 +130,10 @@ class StatisticalHotspotDetector:
         metrics : VolumeMetrics
             Current volume metrics
         """
+        if volume_id in self.last_timestamp and self.last_timestamp[volume_id] == metrics.timestamp:
+            return
+        self.last_timestamp[volume_id] = metrics.timestamp
+
         hist = self.history[volume_id]
         
         # Append new metrics to rolling window

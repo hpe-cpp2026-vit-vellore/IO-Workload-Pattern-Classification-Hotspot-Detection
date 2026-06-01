@@ -244,7 +244,8 @@ class InferenceHub:
                 write_latency_p99_us=float(row["write_latency_p99_us"]),
                 capacity_used_pct=float(row.get("capacity_used_pct", 0.0)),
             )
-            stat_alert = self.ensemble.stat_detector.update(volume_id, metrics)
+            stat_score, stat_alert = self.ensemble.stat_detector.detect_hotspot(volume_id, metrics)
+            self.ensemble.stat_detector.update_baseline(volume_id, metrics)  # update once here
             if stat_alert is not None:
                 return float(min(stat_alert.score, 100.0))
             return 0.0
