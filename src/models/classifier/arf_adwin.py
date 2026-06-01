@@ -27,6 +27,7 @@ import json
 import joblib
 import sys
 from pathlib import Path
+import mlflow
 
 import numpy as np
 import pandas as pd
@@ -257,6 +258,41 @@ def main() -> None:
     model_path = MODEL_DIR / "arf_model.pkl"
     joblib.dump(model, model_path)
     print(f"ARF model serialized → {model_path.relative_to(ROOT)}")
+
+    # ── MLflow Tracking ───────────────────────────────────────────────────────
+    mlflow.set_experiment("io_workload_classifier")
+
+    with mlflow.start_run(run_name="arf_adwin"):
+        mlflow.log_params({
+            "n_models": ARF_CONFIG["n_models"],
+            "grace_period": ARF_CONFIG["grace_period"],
+            "adwin_delta": ARF_CONFIG["delta"],
+            "adwin_warning_delta": ARF_CONFIG["warning_delta"],
+            "seed": ARF_CONFIG["seed"],
+        })
+        
+        for split_name, summary in [
+            ("train", train_summary),
+            ("val", val_summary),
+            ("test", test_summary),
+        ]:
+            mlflow.log_metric(
+                f"{split_name}_prequential_accuracy",
+                summary["final_accuracy"]
+            )
+            mlflow.log_metric(
+                f"{split_name}_drift_events",
+                summary["drift_events"]
+            )
+            for cls_name, cls_metrics in summary["per_class"].items():
+                mlflow.log_metric(f"{split_name}_{cls_name}_f1", cls_metrics["f1"])
+        
+        mlflow.log_metric(
+            "hpe_target_met",
+            1.0 if test_summary["final_accuracy"] >= 0.95 else 0.0
+        )
+        mlflow.log_artifact(str(metrics_path))
+        mlflow.log_artifact(str(curve_path))
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n" + "=" * 70)

@@ -26,3 +26,21 @@ venv\Scripts\python.exe -m src.pipeline.stream_worker
 ## Docker Notes
 
 The Docker setup bind-mounts the `models/` directory at runtime and does not bake model artifacts into the image. On a fresh clone, `docker compose up` will fail until the trained artifacts are present (for example, `models/anomaly/ensemble/lstm_ae_model.pth` and related ensemble stats/config). Run the training pipeline first or place the prebuilt artifacts into `models/` before starting the containers.
+
+## Experiment Tracking
+
+MLflow is integrated into both the classifier and capacity forecaster training scripts to track hyperparameters, metrics, and model artifacts.
+
+To view and compare training runs:
+1. Run the training scripts or execute the full pipeline:
+   ```bash
+   venv/bin/python scripts/train_all.py
+   ```
+2. Launch the MLflow UI from the project root:
+   ```bash
+   mlflow ui --port 5000
+   ```
+3. Open http://127.0.0.1:5000 in your browser.
+
+All experiment data is stored locally in the `mlruns/` directory at the project root, which is gitignored to avoid checking large model run metrics into version control.
+

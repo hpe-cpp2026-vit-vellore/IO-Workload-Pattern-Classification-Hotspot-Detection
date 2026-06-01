@@ -41,6 +41,8 @@ import lightgbm as lgb
 import numpy as np
 import optuna
 import pandas as pd
+import mlflow
+import mlflow.lightgbm
 from joblib import dump
 from sklearn.metrics import (
     accuracy_score,
@@ -309,6 +311,46 @@ def main() -> None:
     model_path = MODEL_DIR / "lightgbm_tuned_model.pkl"
     dump(final_model, model_path)
     print(f"  Model → {model_path.relative_to(ROOT)}")
+
+    # ── MLflow Tracking ───────────────────────────────────────────────────────
+    mlflow.set_experiment("io_workload_classifier")
+
+    with mlflow.start_run(run_name="lightgbm_tuned"):
+        # Log best Optuna hyperparameters
+        mlflow.log_params(best.params)
+        mlflow.log_param("n_estimators_used", best_iteration)
+        mlflow.log_param("n_trials_completed", len(completed))
+        mlflow.log_param("n_classes", N_CLASSES)
+        mlflow.log_param("seed", SEED)
+        
+        # Log metrics for each split
+        for split_name in ["train", "val", "test"]:
+            acc = metrics[split_name]["accuracy"]
+            mlflow.log_metric(f"{split_name}_accuracy", acc)
+            report = metrics[split_name]["classification_report"]
+            label_names = {
+                "0": "DB_OLTP", "1": "VM", "2": "Backup",
+                "3": "AI_Training", "4": "AI_Inference"
+            }
+            for cls_id, cls_name in label_names.items():
+                if cls_id in report:
+                    mlflow.log_metric(
+                        f"{split_name}_{cls_name}_f1",
+                        report[cls_id]["f1-score"]
+                    )
+            
+        # Log the HPE target check
+        test_acc = metrics["test"]["accuracy"]
+        mlflow.log_metric("hpe_target_met", 1.0 if test_acc >= 0.95 else 0.0)
+        
+        # Log model artifact
+        mlflow.lightgbm.log_model(final_model, artifact_path="lightgbm_tuned_model")
+        
+        # Log feature importance CSV as artifact
+        mlflow.log_artifact(str(fi_path))
+        mlflow.log_artifact(str(metrics_path))
+        
+        print(f"MLflow run logged. View at: mlflow ui")
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n" + "=" * 70)

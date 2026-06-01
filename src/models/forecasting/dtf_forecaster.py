@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import mlflow
+
 import numpy as np
 import pandas as pd
 import torch
@@ -483,6 +485,64 @@ def main() -> int:
     with stats_path.open("w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, default=str)
     logger.info("Wrote training stats: %s", stats_path)
+
+    # ── MLflow Tracking ────────────────────────────────────────────────────────
+    mlflow.set_experiment("io_capacity_forecasting")
+
+    with mlflow.start_run(run_name="nbeats_dtf"):
+        mlflow.log_params({
+            "input_size": INPUT_SIZE,
+            "forecast_size": FORECAST_SIZE,
+            "dtf_forecast_days": DTF_FORECAST_DAYS,
+            "n_stacks": N_STACKS,
+            "n_blocks": N_BLOCKS,
+            "hidden_size": HIDDEN_SIZE,
+            "n_layers": N_LAYERS,
+            "dropout": DROPOUT,
+            "n_epochs": N_EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "lr": LR,
+            "patience": PATIENCE,
+        })
+        
+        # Read training stats JSON if it was written and log final val loss
+        if stats_path.exists():
+            with open(stats_path) as f:
+                stats_loaded = json.load(f)
+            # Try nested training block first, then flat keys
+            training_info = stats_loaded.get("training", {})
+            if isinstance(training_info, dict):
+                final_val_loss = training_info.get("best_val_loss") or training_info.get("final_val_loss")
+            else:
+                final_val_loss = None
+            if final_val_loss is None:
+                final_val_loss = stats_loaded.get("best_val_loss") or stats_loaded.get("final_val_loss")
+            if final_val_loss is not None:
+                mlflow.log_metric("best_val_loss", final_val_loss)
+        
+        # Count volumes with DTF within warning threshold
+        dtf_path = out_dir / "dtf_forecast.json"
+        if dtf_path.exists():
+            with open(dtf_path) as f:
+                dtf_data = json.load(f)
+            
+            # Handle both list of dicts and dict-of-dicts
+            if isinstance(dtf_data, dict):
+                items = dtf_data.values()
+            elif isinstance(dtf_data, list):
+                items = dtf_data
+            else:
+                items = []
+
+            critical_count = sum(
+                1 for v in items
+                if (v.get("dtf_critical_days") is not None and v["dtf_critical_days"] <= 7) or
+                   (v.get("dtf_critical_95pct_days") is not None and v["dtf_critical_95pct_days"] <= 7)
+            )
+            mlflow.log_metric("volumes_critical_dtf_7d", critical_count)
+        
+        model_artifact_path = out_dir / "nbeats_model.pth"
+        mlflow.log_artifact(str(model_artifact_path))
 
     # -- Console summary ----------------------------------------------------
     print("\n" + "=" * 60)

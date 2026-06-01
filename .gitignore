@@ -243,3 +243,7 @@ models/forecasting/tft_model.pth
 models/forecasting/tft_training_stats.json
 models/telemetry_parser.dll
 models/bounds.json
+
+# MLflow tracking
+mlruns/
+mlflow.db
