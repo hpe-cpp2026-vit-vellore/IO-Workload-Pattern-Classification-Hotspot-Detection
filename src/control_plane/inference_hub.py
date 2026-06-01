@@ -208,6 +208,20 @@ class InferenceHub:
             except Exception as e:
                 logger.warning("Failed to load DemandForecaster: %s", e)
 
+    def known_volumes(self) -> set:
+        """
+        Returns the union of all known volume IDs from:
+        - Static historical features DataFrame
+        - Live features buffer
+        - Topology graph
+        This is the authoritative set for API volume validation.
+        """
+        ids = set(self.features_df["volume_id"].unique())
+        if not self.live_features_df.empty:
+            ids.update(self.live_features_df["volume_id"].unique())
+        ids.update(self.topology.all_volumes())
+        return ids
+
     def combined_features(self) -> pd.DataFrame:
         """Return historical + live features merged for model queries.
 

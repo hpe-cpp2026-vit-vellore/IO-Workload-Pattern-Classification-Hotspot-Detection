@@ -1035,6 +1035,10 @@ async def startup_event():
     
     # Pre-warm cache in the BACKGROUND so /health responds immediately
     asyncio.create_task(_warmup_cache())
+
+    global _known_volumes_cache, _known_volumes_cache_built_at
+    _known_volumes_cache = hub.known_volumes()
+    _known_volumes_cache_built_at = time.time()
             
     logger.info("Control Plane engines and models loaded. Server is ready (cache warming in background).")
 
@@ -1049,8 +1053,24 @@ async def shutdown_event():
 
 
 # Helper: Validate volume_id
+# Module-level cache for known volumes — rebuilt lazily when hub is ready.
+# Avoids a full 432K-row column scan on every API request.
+_known_volumes_cache: set = set()
+_known_volumes_cache_built_at: float = 0.0
+_KNOWN_VOLUMES_CACHE_TTL_SECONDS: float = 30.0  # rebuild at most every 30s
+
 def validate_volume(volume_id: str):
-    if hub is None or volume_id not in hub.features_df["volume_id"].unique():
+    global _known_volumes_cache, _known_volumes_cache_built_at
+    if hub is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Control plane is still initializing."
+        )
+    now = time.time()
+    if now - _known_volumes_cache_built_at > _KNOWN_VOLUMES_CACHE_TTL_SECONDS:
+        _known_volumes_cache = hub.known_volumes()
+        _known_volumes_cache_built_at = now
+    if volume_id not in _known_volumes_cache:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Volume '{volume_id}' not found in the storage cluster."
