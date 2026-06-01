@@ -116,7 +116,8 @@ class TestValidateVolume(unittest.TestCase):
         api_main.fast_hotspot_scores[vol_id] = 75.0
         
         # Test GET /volumes
-        vols = api_main.get_volumes()
+        import asyncio
+        vols = asyncio.run(api_main.get_volumes())
         self.assertGreater(len(vols), 0)
         found_vol = next((v for v in vols if v["volume_id"] == vol_id), None)
         self.assertIsNotNone(found_vol)

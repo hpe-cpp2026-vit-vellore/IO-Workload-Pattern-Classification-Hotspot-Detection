@@ -1216,7 +1216,7 @@ def get_kpi():
 
 
 @app.get("/volumes", status_code=status.HTTP_200_OK)
-def get_volumes():
+async def get_volumes():
     """Get all 50 volumes in the storage pool with their current status and hotspot scores."""
     result = []
     all_vols = hub.known_volumes() if hub is not None else set()
