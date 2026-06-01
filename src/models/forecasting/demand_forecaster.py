@@ -63,14 +63,15 @@ class DemandForecaster:
         feature_cols = ["hour_sin", "hour_cos", "day_sin", "day_cos"]
 
         n_vols = int(df["volume_id"].nunique())
-        started_at = time.perf_counter()
+        start_perf = time.perf_counter()
+        started_at_wall = time.time()
         self.fit_status.update({
             "state": "running",
             "completed": 0,
             "total": n_vols,
             "percent": 0.0,
             "current_volume": None,
-            "started_at": started_at,
+            "started_at": started_at_wall,
             "finished_at": None,
         })
 
@@ -124,7 +125,7 @@ class DemandForecaster:
                         logger.debug("Failed to fit throughput quantile %s for %s: %s", q, vol_id, e)
 
                 self.trained_volumes.add(vol_id)
-                elapsed = time.perf_counter() - started_at
+                elapsed = time.perf_counter() - start_perf
                 percent_done = idx * 100.0 / n_vols if n_vols else 100.0
                 self.fit_status.update({
                     "completed": idx,
@@ -143,14 +144,14 @@ class DemandForecaster:
                 logger.warning("Unexpected error while fitting volume %s (%d/%d): %s", vol_id, idx, n_vols, e)
                 continue
 
-        total_elapsed = time.perf_counter() - started_at
+        total_elapsed = time.perf_counter() - start_perf
         self.fit_status.update({
             "state": "done",
             "completed": n_vols,
             "total": n_vols,
             "percent": 100.0 if n_vols else 100.0,
             "current_volume": None,
-            "finished_at": time.perf_counter(),
+            "finished_at": time.time(),
         })
         logger.info("DemandForecaster fit complete: 100.0%% (%d/%d) in %.1fs", n_vols, n_vols, total_elapsed)
 
