@@ -1048,8 +1048,8 @@ def run_ensemble_on_data(
     print(f"      Stats   → {stats_path}")
 
     # Model artefacts
-    ensemble.save(out / "model")
-    print(f"      Models  → {out / 'model'}/")
+    ensemble.save(out / "models")
+    print(f"      Models  → {out / 'models'}/")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     _banner("DETECTION SUMMARY")

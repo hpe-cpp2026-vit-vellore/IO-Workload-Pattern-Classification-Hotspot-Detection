@@ -1,22 +1,22 @@
 {
-  "total_detections": 854,
+  "total_detections": 946,
   "volumes_monitored": 15,
   "volumes_with_baselines": 15,
   "detections_per_volume": {
-    "vol_035": 68,
-    "vol_036": 65,
-    "vol_037": 66,
-    "vol_038": 42,
-    "vol_039": 60,
-    "vol_040": 65,
-    "vol_041": 67,
-    "vol_042": 41,
-    "vol_043": 51,
-    "vol_044": 61,
-    "vol_045": 57,
-    "vol_046": 49,
-    "vol_047": 43,
-    "vol_048": 56,
-    "vol_049": 63
+    "vol_035": 88,
+    "vol_036": 67,
+    "vol_037": 73,
+    "vol_038": 47,
+    "vol_039": 59,
+    "vol_040": 58,
+    "vol_041": 80,
+    "vol_042": 52,
+    "vol_043": 56,
+    "vol_044": 63,
+    "vol_045": 62,
+    "vol_046": 52,
+    "vol_047": 55,
+    "vol_048": 76,
+    "vol_049": 58
   }
 }
