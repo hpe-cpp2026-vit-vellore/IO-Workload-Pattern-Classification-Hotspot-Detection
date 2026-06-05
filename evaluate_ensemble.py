@@ -28,7 +28,7 @@ ground_truth = (
 ).values
 
 # Load ensemble predictions
-ensemble_df = pd.read_csv("models/anomaly/ensemble_scores.csv")
+ensemble_df = pd.read_csv("models/anomaly/ensemble/ensemble_scores.csv")
 y_pred = ensemble_df["is_anomaly"].values
 
 # Metrics
