@@ -92,6 +92,7 @@ def objective(
         "seed":              SEED,
         "num_threads":       -1,
         "boosting_type":     "gbdt",
+        "class_weight":      "balanced",
 
         # ── Tree structure ────────────────────────────────────────────────────
         "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
@@ -258,6 +259,7 @@ def main() -> None:
     final_model = lgb.LGBMClassifier(
         objective="multiclass",
         num_class=N_CLASSES,
+        class_weight="balanced",
         metric="multi_logloss",
         verbosity=-1,
         random_state=SEED,

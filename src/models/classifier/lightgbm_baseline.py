@@ -65,6 +65,7 @@ def main() -> None:
     model = lgb.LGBMClassifier(
         objective="multiclass",
         num_class=len(labels),
+        class_weight="balanced",
         n_estimators=300,
         learning_rate=0.1,
         num_leaves=31,

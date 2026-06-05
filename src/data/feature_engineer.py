@@ -172,24 +172,27 @@ def add_rolling_window_features(df: pd.DataFrame) -> pd.DataFrame:
     
     for window_rows, label in windows.items():
         for metric in metrics:
-            # Rolling mean
-            df[f"{metric}_roll_{label}_mean"] = (
+            # 1. Rolling mean
+            roll_mean = (
                 df.groupby("volume_id", sort=False, observed=True)[metric]
                 .rolling(window=window_rows, min_periods=1)
                 .mean()
                 .reset_index(level=0, drop=True)
-                .round(2)
             )
+            df[f"{metric}_roll_{label}_mean"] = roll_mean.round(2)
             
-            # Rolling std
-            df[f"{metric}_roll_{label}_std"] = (
+            # 2. Rolling std
+            roll_std = (
                 df.groupby("volume_id", sort=False, observed=True)[metric]
                 .rolling(window=window_rows, min_periods=1)
                 .std()
                 .reset_index(level=0, drop=True)
                 .fillna(0)
-                .round(2)
             )
+            df[f"{metric}_roll_{label}_std"] = roll_std.round(2)
+            
+            # 3. Coefficient of Variation (The Burstiness Key)
+            df[f"{metric}_roll_{label}_cv"] = (roll_std / (roll_mean + 1e-9)).round(4)
     
     return df
 

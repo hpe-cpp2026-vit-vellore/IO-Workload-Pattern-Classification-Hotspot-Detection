@@ -180,10 +180,22 @@ def generate_metrics_from_latent(
     )
     queue_depth = np.clip(queue_depth, 1, 64).round(0).astype(int)
 
-    seq_bins = np.array([0.1, 0.22, 0.35, 0.5, 0.65, 0.78, 0.88, 0.95])
+    base_size_map = {
+        "DB_OLTP": 8,       
+        "VM": 32,           
+        "Backup": 512,      
+        "AI_Training": 256, 
+        "AI_Inference": 64  
+    }
+    base_sizes = df["workload_type"].map(base_size_map).to_numpy()
+    
+    # Add log-normal jitter to simulate real-world variance
+    raw_sizes = base_sizes * rng.lognormal(mean=0.0, sigma=0.4, size=n)
+    
+    # Snap the randomized sizes to the nearest standard storage block size
     size_buckets = np.array([4, 8, 16, 32, 64, 128, 256, 512, 1024])
-    bucket_idx = np.digitize(sequential_ratio, seq_bins)
-    io_size_avg_kb = size_buckets[bucket_idx]
+    idx = np.abs(raw_sizes[:, None] - size_buckets).argmin(axis=1)
+    io_size_avg_kb = size_buckets[idx]
 
     total_throughput_mbps = (total_iops * io_size_avg_kb) / 1024.0
     eff = np.clip(rng.normal(1.0, 0.15, n) + 0.1 * intensity, 0.5, 1.6)
