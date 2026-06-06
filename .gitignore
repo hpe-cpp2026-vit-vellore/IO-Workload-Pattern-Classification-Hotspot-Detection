@@ -247,3 +247,6 @@ models/bounds.json
 # MLflow tracking
 mlruns/
 mlflow.db
+
+# Local development files
+dev's_project.xml
