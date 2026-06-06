@@ -40,7 +40,7 @@ services:
   dashboard:
     build: .
     image: hpe-control-plane:latest
-    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    command: streamlit run dashboard/Home.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
     ports:
       - "8501:8501"
     environment:

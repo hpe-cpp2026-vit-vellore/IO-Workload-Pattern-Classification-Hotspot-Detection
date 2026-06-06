@@ -10,7 +10,7 @@ venv\Scripts\python.exe -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
 ```powershell
-venv\Scripts\python.exe -m streamlit run dashboard/app.py
+venv\Scripts\python.exe -m streamlit run dashboard/Home.py
 ```
 
 ```powershell

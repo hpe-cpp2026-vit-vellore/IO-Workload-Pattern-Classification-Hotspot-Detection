@@ -31,7 +31,7 @@ The implementation follows the CPP architecture layers and maps them to concrete
   - FastAPI application and endpoint orchestration: `api/main.py`
   - Request schemas: `api/schemas/models.py`
 - Dashboard:
-  - Streamlit UI: `dashboard/app.py`
+  - Streamlit UI: `dashboard/Home.py`
 - Model Layer:
   - Classifier: `src/models/classifier/*`
   - Anomaly detection: `src/models/anomaly/*`
@@ -302,7 +302,7 @@ python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
 ```bash
-python3 -m streamlit run dashboard/app.py
+python3 -m streamlit run dashboard/Home.py
 ```
 
 ```bash
