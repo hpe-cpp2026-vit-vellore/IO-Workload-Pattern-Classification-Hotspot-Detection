@@ -8,6 +8,7 @@ Provides status for rollback tracking.
 """
 
 import logging
+import uuid
 from typing import Dict, Any, Optional
 from src.pipeline.topology_graph import TopologyGraph
 
@@ -16,8 +17,8 @@ logger = logging.getLogger(__name__)
 class Rebalancer:
     """Handles execution and rollback of control plane rebalancing actions."""
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, actuator: Optional[Any] = None) -> None:
+        self.actuator = actuator
 
     def execute_migration(self, volume_id: str, target_node: str, topology: TopologyGraph) -> Dict[str, Any]:
         """
@@ -43,6 +44,38 @@ class Rebalancer:
 
         logger.info("Executing migration: %s from %s to %s", volume_id, source_node, target_node)
 
+        op_id = str(uuid.uuid4())
+        size_gb = 50.0  # default capacity fallback
+        if topology.graph.has_node(volume_id):
+            size_gb = topology.graph.nodes[volume_id].get("capacity_gb") or 50.0
+
+        # Register move with safety monitor if actuator has one
+        if self.actuator and hasattr(self.actuator, "monitor") and self.actuator.monitor:
+            if hasattr(self.actuator.monitor, "register_move"):
+                self.actuator.monitor.register_move(op_id, volume_id, source_node, target_node, size_gb)
+
+        # Execute physical or stub move via actuator
+        actuator_success = True
+        if self.actuator:
+            try:
+                actuator_success = self.actuator.execute_move(volume_id, source_node, target_node, size_gb, op_id)
+            except Exception as e:
+                logger.error("Actuator execute_move failed: %s", e)
+                actuator_success = False
+                if hasattr(self.actuator.monitor, "mark_failed"):
+                    self.actuator.monitor.mark_failed(op_id, str(e))
+
+        if not actuator_success:
+            logger.error("Migration for %s failed at the actuator layer.", volume_id)
+            return {
+                "action": "migrate",
+                "volume_id": volume_id,
+                "source_node": source_node,
+                "target_node": target_node,
+                "status": "failed",
+                "op_id": op_id
+            }
+
         # 1. Update graph edges
         if topology.graph.has_edge(volume_id, source_node):
             topology.graph.remove_edge(volume_id, source_node)
@@ -65,7 +98,8 @@ class Rebalancer:
             "volume_id": volume_id,
             "source_node": source_node,
             "target_node": target_node,
-            "status": "success"
+            "status": "success",
+            "op_id": op_id
         }
 
     def execute_qos_shaping(self, volume_id: str, iops_limit: float, topology: TopologyGraph) -> Dict[str, Any]:
@@ -124,7 +158,16 @@ class Rebalancer:
         if action == "migrate":
             source_node = action_state["source_node"]
             target_node = action_state["target_node"]
-            # Restore to source_node
+            op_id = action_state.get("op_id", "rollback-op")
+            
+            # Rollback via actuator first
+            if self.actuator:
+                try:
+                    self.actuator.rollback_move(volume_id, source_node, target_node, op_id)
+                except Exception as e:
+                    logger.error("Actuator rollback failed: %s", e)
+
+            # Restore to source_node in graph
             if topology.graph.has_edge(volume_id, target_node):
                 topology.graph.remove_edge(volume_id, target_node)
             topology.graph.add_edge(volume_id, source_node, relation="resides_on")

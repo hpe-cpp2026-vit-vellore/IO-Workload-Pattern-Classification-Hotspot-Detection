@@ -35,6 +35,8 @@ if str(ANOMALY_DIR) not in sys.path:
     sys.path.insert(0, str(ANOMALY_DIR))
 
 from src.control_plane import InferenceHub, Rebalancer, ActionMonitor, DecisionEngine, WhatIfSimulator
+from src.control_plane.capacity_planner import CapacityPlanner
+from src.control_plane.actuators import get_actuator
 from src.control_plane.inference_hub import LABEL_NAMES
 from src.pipeline.telemetry_parser import parse_and_clip, load_or_create_bounds
 from api.schemas.models import (
@@ -103,6 +105,7 @@ engine: Optional[DecisionEngine] = None
 simulator: Optional[WhatIfSimulator] = None
 explainer: Optional[shap.TreeExplainer] = None
 bounds: Dict[str, Any] = {}
+capacity_planner: Optional[CapacityPlanner] = None
 
 # Active SSE connections
 active_streams: Dict[str, List[asyncio.Queue]] = {}
@@ -976,18 +979,29 @@ async def action_monitor_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis, r, use_redis, redis_error, bounds, REDIS_HOST
+    global hub, rebalancer, monitor, engine, simulator, explainer, cached_analysis, r, use_redis, redis_error, bounds, REDIS_HOST, capacity_planner
     logger.info("Initializing Control Plane engines and loading ML models...")
     
     bounds = load_or_create_bounds(PROJECT_ROOT)
     hub = InferenceHub(project_root=PROJECT_ROOT)
-    rebalancer = Rebalancer()
+    
+    # Initialize monitor with safety watchdogs and circuit breakers
     monitor = ActionMonitor(
         rollback_threshold_pct=hub.policy.get("safety_guardrails", {}).get("rollback_if_target_latency_increases_pct", 20.0),
-        rollback_timeout_minutes=hub.policy.get("safety_guardrails", {}).get("rollback_timeout_minutes", 5.0)
+        rollback_timeout_minutes=hub.policy.get("safety_guardrails", {}).get("rollback_timeout_minutes", 5.0),
+        stall_timeout_seconds=60.0,  # 1 minute safety watchdog for testing/demo
+        max_rollback_rate_pct=1.0   # Success Criteria 4 threshold
     )
+    
+    # Wire StubActuator into Rebalancer to execute simulated move phases
+    actuator = get_actuator("stub", monitor, speed_up=100.0)
+    rebalancer = Rebalancer(actuator=actuator)
+    
     engine = DecisionEngine(hub, rebalancer, monitor)
     simulator = WhatIfSimulator(hub)
+    capacity_planner = CapacityPlanner(
+        auto_scale_enabled=hub.policy.get("rebalance_policy", {}).get("autoscale", {}).get("enabled", False)
+    )
     
     # Initialize SHAP explainer
     explainer = shap.TreeExplainer(hub.classifier)
@@ -1526,6 +1540,14 @@ def get_noisy_neighbors():
                 ]
             })
     return noisy_pairs
+
+@app.get("/capacity/plan", status_code=status.HTTP_200_OK)
+def get_capacity_plan():
+    """Generates cluster-wide capacity planning and auto-scale recommendations."""
+    if hub is None or capacity_planner is None:
+        raise HTTPException(status_code=503, detail="Hub or Capacity Planner not initialized.")
+    sync_topology_from_redis()
+    return capacity_planner.plan(hub.topology, cached_analysis)
 
 
 @app.get("/forecast/capacity", status_code=status.HTTP_200_OK)
