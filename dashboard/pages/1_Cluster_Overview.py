@@ -219,7 +219,7 @@ def live_telemetry_view():
             </tbody>
         </table>
         """
-        st.write(html_table, unsafe_allow_html=True)
+        st.markdown(html_table, unsafe_allow_html=True)
     else:
         st.info("No active volume metadata returned.")
 
