@@ -172,10 +172,10 @@ def live_telemetry_view():
             hs_score = vol.get("hotspot_score") or 0.0
             
             # Status styling
-            if hs_score >= 70 or latency > 1500:
+            if hs_score >= 70 or latency >= 8000.0:
                 badge = '<span class="badge badge-critical">Critical</span>'
                 color = "#ff1744"
-            elif hs_score >= 40 or latency > 1000:
+            elif hs_score >= 40 or latency >= 5000.0:
                 badge = '<span class="badge badge-warning">Warning</span>'
                 color = "#ff9100"
             else:
