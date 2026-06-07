@@ -50,5 +50,37 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  stream-worker:
+    build: .
+    image: hpe-control-plane:latest
+    command: python src/pipeline/stream_worker.py
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - ./models:/app/models
+      - ./configs:/app/configs
+      - ./data:/app/data
+    restart: unless-stopped
+
+  telemetry-generator:
+    build: .
+    image: hpe-control-plane:latest
+    command: python scripts/telemetry_playback.py
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
 volumes:
   redis-data:

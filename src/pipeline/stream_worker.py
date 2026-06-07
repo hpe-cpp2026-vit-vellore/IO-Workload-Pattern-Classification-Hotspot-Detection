@@ -225,6 +225,10 @@ def _stop_wsl_keepalive():
 
 def _detect_redis_host() -> str:
     """Auto-detect the best Redis host address (handles WSL2 networking)."""
+    import os
+    env_host = os.getenv("REDIS_HOST")
+    if env_host:
+        return env_host
     import subprocess, socket
     candidates = []
     try:

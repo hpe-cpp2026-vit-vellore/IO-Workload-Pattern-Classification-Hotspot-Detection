@@ -82,6 +82,10 @@ def _detect_redis_host() -> str:
       2. ``localhost`` — Windows sometimes proxies this into WSL2.
       3. ``127.0.0.1`` — works only when Redis is native on Windows.
     """
+    import os
+    env_host = os.getenv("REDIS_HOST")
+    if env_host:
+        return env_host
     import subprocess
     # Try to get WSL2 IP
     candidates = []

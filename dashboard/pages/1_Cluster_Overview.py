@@ -186,39 +186,35 @@ def live_telemetry_view():
             history = st.session_state["sparkline_history"].get(vol_id, [])
             sparkline_svg = generate_sparkline_svg(history, color)
             
-            table_rows.append(f"""
-            <tr>
-                <td style="font-family: monospace; font-weight: bold; color: #00f0ff;">{vol_id}</td>
-                <td>{workload}</td>
-                <td>{tier}</td>
-                <td>{int(iops):,}</td>
-                <td style="color: {color}; font-weight: 600;">{latency:.1f} µs</td>
-                <td>{hs_score:.1f}</td>
-                <td>{badge}</td>
-                <td>{sparkline_svg}</td>
-            </tr>
-            """)
+            table_rows.append(f"""<tr>
+<td style="font-family: monospace; font-weight: bold; color: #00f0ff;">{vol_id}</td>
+<td>{workload}</td>
+<td>{tier}</td>
+<td>{int(iops):,}</td>
+<td style="color: {color}; font-weight: 600;">{latency:.1f} µs</td>
+<td>{hs_score:.1f}</td>
+<td>{badge}</td>
+<td>{sparkline_svg}</td>
+</tr>""")
             
         rows_content = "\n".join(table_rows)
-        html_table = f"""
-        <table class="dense-table">
-            <thead>
-                <tr>
-                    <th>Volume ID</th>
-                    <th>Workload Class</th>
-                    <th>Tier</th>
-                    <th>IOPS</th>
-                    <th>Latency</th>
-                    <th>Hotspot Score</th>
-                    <th>Status</th>
-                    <th>Latency Trend (12 Ticks)</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows_content}
-            </tbody>
-        </table>
-        """
+        html_table = f"""<table class="dense-table">
+<thead>
+<tr>
+<th>Volume ID</th>
+<th>Workload Class</th>
+<th>Tier</th>
+<th>IOPS</th>
+<th>Latency</th>
+<th>Hotspot Score</th>
+<th>Status</th>
+<th>Latency Trend (12 Ticks)</th>
+</tr>
+</thead>
+<tbody>
+{rows_content}
+</tbody>
+</table>"""
         st.markdown(html_table, unsafe_allow_html=True)
     else:
         st.info("No active volume metadata returned.")
