@@ -292,7 +292,7 @@ with tab_history:
     else:
         hist_df = pd.DataFrame(history)
         if "timestamp" in hist_df.columns:
-            hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
+            hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"], format="mixed", errors="coerce")
             hist_df = hist_df.sort_values("timestamp", ascending=False)
             
         display_rows = []

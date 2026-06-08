@@ -336,6 +336,7 @@ def run_worker():
     
     last_trim_time = time.time()
     last_analyzed_time = {}
+    last_processed_ts = None  # Track last event timestamp to detect playback resets
     
     while True:
         try:
@@ -398,6 +399,19 @@ def run_worker():
                     event["timestamp"] = ts
                     if last_ts is None or ts > last_ts:
                         last_ts = ts
+                    
+                    # Detect telemetry playback reset (time jumping backward >30 min)
+                    if last_processed_ts is not None and ts < last_processed_ts - pd.Timedelta(minutes=30):
+                        logger.warning(
+                            "Telemetry playback reset detected (event ts=%s << last=%s). "
+                            "Clearing stale hotspot start times and action queue.",
+                            ts, last_processed_ts
+                        )
+                        engine.hotspot_start_times.clear()
+                        engine.action_queue.clear()
+                        last_processed_ts = ts
+                    elif last_processed_ts is None or ts > last_processed_ts:
+                        last_processed_ts = ts
 
                     # A. Update local live features dataframe for time-series context
                     new_row = pd.DataFrame([event])

@@ -52,7 +52,7 @@ if "sparkline_history" not in st.session_state:
     st.session_state["sparkline_history"] = {}
 
 # --- High-Frequency Telemetry Fragment ---
-@st.fragment
+@st.fragment(run_every=3)
 def live_telemetry_view():
     kpi_data = get_api_data("/kpi") or {}
     volumes_list = get_api_data("/volumes") or []
@@ -150,6 +150,14 @@ def live_telemetry_view():
     # 3. Storage Admin High-Density Table
     st.subheader("📋 Storage Admin - High-Density Volume Status")
     if volumes_list:
+        # Fetch active policy to derive status badge thresholds
+        policy = get_api_data("/policy") or {}
+        min_score_trigger = policy.get("rebalance_policy", {}).get("min_hotspot_score_to_trigger", 70)
+        # Critical = at or above the policy action threshold
+        # Warning = at 60% of the threshold (early heads-up)
+        critical_threshold = float(min_score_trigger)
+        warning_threshold = critical_threshold * 0.6
+
         # Update rolling latency history for sparklines
         for vol in volumes_list:
             vol_id = vol["volume_id"]
@@ -171,11 +179,11 @@ def live_telemetry_view():
             latency = vol.get("current_latency_us") or 0.0
             hs_score = vol.get("hotspot_score") or 0.0
             
-            # Status styling
-            if hs_score >= 70 or latency >= 8000.0:
+            # Status styling — uses policy-aware thresholds
+            if hs_score >= critical_threshold or latency >= 8000.0:
                 badge = '<span class="badge badge-critical">Critical</span>'
                 color = "#ff1744"
-            elif hs_score >= 40 or latency >= 5000.0:
+            elif hs_score >= warning_threshold or latency >= 5000.0:
                 badge = '<span class="badge badge-warning">Warning</span>'
                 color = "#ff9100"
             else:
@@ -301,10 +309,8 @@ def live_telemetry_view():
         else:
             st.success("🟢 No active anomalies or SLA breaches reported.")
 
-    # Auto-rerun telemetry fragment block if live data is running
-    if is_live:
-        time.sleep(3)
-        st.rerun()
+    # Auto-rerun is handled natively by the st.fragment(run_every=3) decorator configuration
+    pass
 
 # Run the live telemetry view fragment
 live_telemetry_view()

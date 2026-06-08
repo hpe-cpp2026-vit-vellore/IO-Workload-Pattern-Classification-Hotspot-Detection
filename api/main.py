@@ -353,16 +353,37 @@ class AnalysisCache:
 # In-memory cache for live telemetry state (warmup)
 cached_analysis = AnalysisCache(ttl_seconds=60.0)
 live_state = LiveTelemetryState()
+_last_sync_time = 0.0
 
 def sync_topology_from_redis():
     """Synchronizes in-memory topology metrics and structure with latest metrics in Redis."""
-    global use_redis, r, hub
+    global use_redis, r, hub, _last_sync_time
+    now = time.time()
+    if now - _last_sync_time < 15.0:  # Throttle to at most once every 15 seconds
+        return
+    _last_sync_time = now
+
     STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
     if use_redis and r is not None and hub is not None:
         try:
-            # 1. Sync metrics
-            for vol_id in hub.features_df["volume_id"].unique():
-                metrics_data = r.hgetall(f"volume:{vol_id}:metrics")
+            vol_ids = list(hub.features_df["volume_id"].unique())
+            pipe = r.pipeline()
+            
+            # Queue metrics HGETALL queries
+            for vol_id in vol_ids:
+                pipe.hgetall(f"volume:{vol_id}:metrics")
+                
+            # Queue global topology HGETALL queries
+            pipe.hgetall("topology:volume_to_node")
+            pipe.hgetall("topology:volume_tier")
+            pipe.hgetall("topology:volume_iops_limit")
+            
+            # Execute all queries in a single network round-trip
+            results = pipe.execute()
+            
+            # 1. Parse metrics
+            for idx, vol_id in enumerate(vol_ids):
+                metrics_data = results[idx]
                 if metrics_data:
                     typed_metrics = {}
                     for k, v in metrics_data.items():
@@ -379,9 +400,13 @@ def sync_topology_from_redis():
                             except ValueError:
                                 typed_metrics[k] = v
                     hub.topology.update_volume_metrics(vol_id, typed_metrics)
+                    
+            # Extract the remaining query results
+            assignments = results[len(vol_ids)]
+            tiers = results[len(vol_ids) + 1]
+            limits = results[len(vol_ids) + 2]
 
             # 2. Sync topology structure assignments
-            assignments = r.hgetall("topology:volume_to_node")
             for vol_id, target_node in assignments.items():
                 if hub.topology.graph.has_node(vol_id) and target_node:
                     source_node = hub.topology.get_node_of_volume(vol_id)
@@ -400,13 +425,11 @@ def sync_topology_from_redis():
                         hub.topology.graph.nodes[vol_id]["node_id"] = target_node
 
             # 3. Sync storage tiers
-            tiers = r.hgetall("topology:volume_tier")
             for vol_id, tier in tiers.items():
                 if hub.topology.graph.has_node(vol_id) and tier:
                     hub.topology.graph.nodes[vol_id]["tier"] = tier
 
             # 4. Sync QoS IOPS limits
-            limits = r.hgetall("topology:volume_iops_limit")
             for vol_id, limit_str in limits.items():
                 if hub.topology.graph.has_node(vol_id):
                     if limit_str == "None" or limit_str == "":
@@ -757,7 +780,7 @@ def _load_control_plane_state():
                     engine.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
                 if monitor is not None:
                     monitor.actions = monitors
-                    monitor.total_actions = len(monitors)
+                    monitor.total_actions = max(len(monitors), len(history))
                     monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
             logger.info("Successfully loaded rebalance history from JSON file.")
         except Exception as e:
@@ -783,7 +806,9 @@ def _load_control_plane_state():
                     monitors[aid] = mon
                 if monitor is not None:
                     monitor.actions = monitors
-                    monitor.total_actions = len(monitors)
+                    # Use action_history length for true count of dispatched actions
+                    history_count = len(engine.action_history) if engine is not None else 0
+                    monitor.total_actions = max(len(monitors), history_count)
                     monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
             
             raw_queue = r.get("control_plane:action_queue")
@@ -881,7 +906,9 @@ def _sync_monitors_from_redis():
             monitors[aid] = mon
         
         monitor.actions = monitors
-        monitor.total_actions = len(monitors)
+        # Use action_history length for true count of dispatched actions
+        history_count = len(engine.action_history) if engine is not None else 0
+        monitor.total_actions = max(len(monitors), history_count)
         monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
 
         raw_history = r.get("control_plane:action_history")
@@ -1282,10 +1309,17 @@ async def get_volumes():
         
         last_analyzed = last_analyzed_time.get(vol_id, 0.0)
         analysis_age_s = round(time.time() - last_analyzed, 1) if last_analyzed > 0 else None
+        
+        live_fast_score = fast_hotspot_scores.get(vol_id)
+        if live_fast_score is not None and live_state.events_received > 0:
+            blended_score = round(0.6 * live_fast_score + 0.4 * analysis["hotspot_score"], 2)
+        else:
+            blended_score = analysis["hotspot_score"]
+            
         result.append({
             "volume_id": vol_id,
-            "hotspot_score": analysis["hotspot_score"],
-            "fast_hotspot_score": fast_hotspot_scores.get(vol_id),
+            "hotspot_score": blended_score,
+            "fast_hotspot_score": live_fast_score,
             "workload_type": analysis["workload_type"],
             "tier": tier,
             "capacity_used_pct": analysis["days_to_fill"].get("capacity_used_pct", 50.0),

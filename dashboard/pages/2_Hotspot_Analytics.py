@@ -113,7 +113,7 @@ with tab_diag:
             st.error("No metrics history returned for this volume.")
         else:
             df_metrics = pd.DataFrame(metrics)
-            df_metrics["timestamp"] = pd.to_datetime(df_metrics["timestamp"])
+            df_metrics["timestamp"] = pd.to_datetime(df_metrics["timestamp"], format="mixed", errors="coerce")
             
             dcol1, dcol2, dcol3 = st.columns([1, 1, 2])
             

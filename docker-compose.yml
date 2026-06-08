@@ -15,7 +15,7 @@ services:
   api:
     build: .
     image: hpe-control-plane:latest
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 2
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
     ports:
       - "8000:8000"
     environment:

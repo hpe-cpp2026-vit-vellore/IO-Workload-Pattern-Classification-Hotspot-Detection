@@ -193,6 +193,17 @@ class DecisionEngine:
                     "Hotspot detected on volume %s (score %.2f >= %.2f). Persistence tracking started.",
                     volume_id, hotspot_score, self.min_hotspot_score
                 )
+            else:
+                # Guard against stale/future start times from previous replay cycles.
+                # When telemetry playback restarts, event timestamps go back to the
+                # beginning of the dataset while hotspot_start_times may hold timestamps
+                # from the end of the previous run, causing negative elapsed durations.
+                if self.hotspot_start_times[volume_id] > timestamp:
+                    logger.warning(
+                        "Resetting stale hotspot start time for %s (was %s, now %s).",
+                        volume_id, self.hotspot_start_times[volume_id], timestamp
+                    )
+                    self.hotspot_start_times[volume_id] = timestamp
             
             elapsed_min = (timestamp - self.hotspot_start_times[volume_id]).total_seconds() / 60.0
             
