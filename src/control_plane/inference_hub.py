@@ -417,19 +417,37 @@ class InferenceHub:
         nbeats_forecast = forecast_volume(self.nbeats, nbeats_in, n_steps_ahead=60, device="cpu")
         nbeats_forecast = np.clip(nbeats_forecast, 0.0, 1.0)
         
-        # Find Days To Fill (DTF)
+        # --- FIXED DTF CALCULATION LOGIC ---
         current_cap = float(row.get("capacity_used_pct", 0.0))
+        # Ensure percentage is normalized to [0, 1] if provided as 0-100
         if current_cap > 1.0:
             current_cap = current_cap / 100.0
-            
+        
         dtf_85 = None
         dtf_95 = None
-        for i, val in enumerate(nbeats_forecast):
-            if val >= 0.85 and dtf_85 is None:
-                dtf_85 = float(i)
-            if val >= 0.95 and dtf_95 is None:
-                dtf_95 = float(i)
-                break
+        
+        # 1. Handle volumes already at or above thresholds
+        if current_cap >= 0.95:
+            dtf_85 = 0.0
+            dtf_95 = 0.0
+        elif current_cap >= 0.85:
+            dtf_85 = 0.0
+            # Forecast critical threshold only
+            for i, val in enumerate(nbeats_forecast):
+                if val >= 0.95 and dtf_95 is None:
+                    dtf_95 = float(i)
+                    break
+        else:
+            # 2. Forecast both thresholds for safe volumes
+            for i, val in enumerate(nbeats_forecast):
+                if val >= 0.85 and dtf_85 is None:
+                    dtf_85 = float(i)
+                if val >= 0.95 and dtf_95 is None:
+                    dtf_95 = float(i)
+                # Break only if BOTH are found to optimize performance
+                if dtf_85 is not None and dtf_95 is not None:
+                    break
+        # ------------------------------------
                 
         # 5. Latency tail risk forecasting (TFT)
         tft_in = self.get_tft_input(volume_id, timestamp)
