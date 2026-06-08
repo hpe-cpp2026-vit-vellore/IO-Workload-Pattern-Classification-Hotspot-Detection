@@ -1511,45 +1511,56 @@ def get_volume_explanation(id: str):
 
 @app.get("/alerts", status_code=status.HTTP_200_OK)
 def get_alerts():
-    """All active alerts sorted by severity."""
+    """All active alerts sorted by severity (Policy & Latency aware)."""
     alerts = []
+    
+    # 1. Pull dynamic thresholds to match the UI Table exactly
+    policy = engine.policy if engine is not None else {}
+    min_score_trigger = float(policy.get("rebalance_policy", {}).get("min_hotspot_score_to_trigger", 70.0))
+    warn_score_trigger = min_score_trigger * 0.6
+    
     for vol_id, analysis in cached_analysis.items():
         if analysis is None:
             continue
-        # Prefer fast real-time statistical score when live telemetry is active,
-        # fall back to full ensemble score from cached analysis
+        
+        # 2. Get Blended Hotspot Score
         live_fast_score = fast_hotspot_scores.get(vol_id)
         if live_fast_score is not None and live_state.events_received > 0:
-            # Blend: 60% fast live score, 40% full ensemble for stability
             score = round(0.6 * live_fast_score + 0.4 * analysis["hotspot_score"], 2)
         else:
             score = analysis["hotspot_score"]
-            
-        if score >= 40:
-            severity = "Normal"
-            if 40 <= score < 60:
-                severity = "Warning"
-            elif 60 <= score < 80:
-                severity = "High"
-            elif score >= 80:
-                severity = "Critical"
-
-            # Prefer live timestamp when available
-            live_event = live_state.latest_by_volume.get(vol_id)
-            if live_event is not None:
-                ts = live_event.get("timestamp")
-                alert_ts = ts.isoformat() if isinstance(ts, pd.Timestamp) else str(ts)
-            else:
-                alert_ts = analysis["timestamp"]
-
+        
+        # 3. Get Current Latency
+        live_event = live_state.latest_by_volume.get(vol_id)
+        if live_event is not None:
+            latency = float(live_event.get("avg_latency_us", 0.0) or 0.0)
+            ts = live_event.get("timestamp")
+            alert_ts = ts.isoformat() if isinstance(ts, pd.Timestamp) else str(ts)
+        else:
+            metrics_dict = hub.topology._volume_metrics.get(vol_id, {}) if hub is not None else {}
+            latency = float(metrics_dict.get("avg_latency_us", 0.0) or 0.0)
+            alert_ts = analysis.get("timestamp")
+        
+        # 4. Unified Alert Logic (Matches Dashboard Table 1:1)
+        is_alert = False
+        if score >= min_score_trigger or latency >= 8000.0:
+            severity = "Critical"
+            is_alert = True
+        elif score >= warn_score_trigger or latency >= 5000.0:
+            severity = "Warning"
+            is_alert = True
+        
+        # 5. Append if triggered
+        if is_alert:
             alerts.append({
                 "volume_id": vol_id,
                 "hotspot_score": score,
+                "current_latency_us": latency,
                 "severity": severity,
-                "workload_type": analysis["workload_type"],
+                "workload_type": analysis.get("workload_type", "Unknown"),
                 "timestamp": alert_ts,
             })
-
+    
     # Sort alerts by score descending
     alerts = sorted(alerts, key=lambda x: x["hotspot_score"], reverse=True)
     return alerts
