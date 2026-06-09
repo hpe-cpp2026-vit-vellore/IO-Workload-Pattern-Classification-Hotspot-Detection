@@ -26,7 +26,17 @@ class WhatIfSimulator:
 
     @property
     def features_df(self) -> pd.DataFrame:
-        return self.hub.combined_features()
+        """Return combined historical + live features for all volumes.
+        
+        Note: This property is only used for volume existence checks and
+        fetching the latest row per volume. For performance-critical operations,
+        the hub's get_volume_features() method should be used directly.
+        """
+        # For simulator queries that need all volumes, we reconstruct the full view
+        # This is acceptable here since simulator operations are infrequent (user-triggered)
+        if self.hub.live_features_df.empty:
+            return self.hub.features_df
+        return pd.concat([self.hub.features_df, self.hub.live_features_df], ignore_index=True)
 
     def simulate_add_capacity_scenario(self, volume_id: str, added_gb: float) -> Dict[str, Any]:
         """Simulate adding storage capacity and compute new Days-to-Fill (DTF)."""
