@@ -23,6 +23,8 @@ from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +60,10 @@ app = FastAPI(
     description="ML-Powered Control Plane for Workload Classification, Hotspot Detection, and Rebalancing.",
     version="1.0.0"
 )
+
+# --- PRODUCTION OBSERVABILITY ---
+Instrumentator().instrument(app).expose(app)
+
 
 # Configure CORS
 import os
@@ -1256,7 +1262,25 @@ def get_kpi():
     }
 
 
+@app.get("/health/live", tags=["System"])
+async def liveness_probe():
+    """Kubernetes Liveness Probe: Verifies the Python ASGI server is running."""
+    return {"status": "alive"}
+
+@app.get("/health/ready", tags=["System"])
+async def readiness_probe():
+    """
+    Kubernetes Readiness Probe: Verifies models are loaded into RAM 
+    and the Inference Hub is ready to accept production traffic.
+    """
+    if hub is None or hub.tft is None or hub.nbeats is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="Models not fully loaded into memory yet.")
+    return {"status": "ready", "message": "Inference Hub loaded and operational"}
+
+
 @app.get("/volumes", status_code=status.HTTP_200_OK)
+
 async def get_volumes():
     """Get all 50 volumes in the storage pool with their current status and hotspot scores."""
     result = []

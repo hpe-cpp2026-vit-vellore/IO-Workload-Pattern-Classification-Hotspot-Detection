@@ -31,6 +31,8 @@ networkx>=3.3
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 requests>=2.31.0
+prometheus-fastapi-instrumentator==7.1.0
+
 
 # Utilities
 pyyaml>=6.0
