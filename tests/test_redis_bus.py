@@ -137,5 +137,37 @@ class TestRedisBusAndFallback(unittest.TestCase):
         # Cleanup
         r.delete(stream_key)
 
+    def test_redis_bus_wrapper(self):
+        """Verify the RedisBus implementation is working correctly and conforms to EventBus."""
+        try:
+            from src.infrastructure.bus_factory import get_event_bus
+            from src.infrastructure.interfaces import EventBus
+            bus = get_event_bus()
+        except Exception:
+            self.skipTest("Local Redis server is not running on settings.redis_url. Skipping wrapper test.")
+            return
+
+        self.assertIsInstance(bus, EventBus)
+        
+        # Test basic publish and stream read via the bus wrapper
+        stream_key = "test:telemetry:bus_stream"
+        bus.delete(stream_key) # delegates to client
+        
+        payload = {"volume_id": "vol_bus_test", "total_iops": 999.0}
+        msg_id = bus.publish(stream_key, payload)
+        self.assertIsNotNone(msg_id)
+        
+        # Test state set and get via the bus wrapper
+        state_key = "test:state:bus_key"
+        state_payload = {"status": "ok", "timestamp": "2026-06-10T12:00:00"}
+        bus.set_state(state_key, state_payload)
+        
+        retrieved_state = bus.get_latest_state(state_key)
+        self.assertEqual(retrieved_state["status"], "ok")
+        
+        # Cleanup
+        bus.delete(stream_key)
+        bus.delete(state_key)
+
 if __name__ == "__main__":
     unittest.main()

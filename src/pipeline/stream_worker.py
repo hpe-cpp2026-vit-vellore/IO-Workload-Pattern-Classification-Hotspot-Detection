@@ -69,9 +69,8 @@ def sync_topology_structure_from_redis(r_client, topology):
 
 def _sync_policy_from_redis(r_client, engine_obj, monitor_obj):
     try:
-        raw_policy = r_client.get("control_plane:policy")
-        if raw_policy:
-            policy = json.loads(raw_policy)
+        policy = r_client.get_latest_state("control_plane:policy")
+        if policy:
             engine_obj.policy = policy
             rebalance = policy.get("rebalance_policy", {})
             engine_obj.rebalance_policy = rebalance
@@ -101,23 +100,20 @@ def _sync_control_plane_state_from_redis(r_client, engine_obj, monitor_obj):
         monitor_obj.total_actions = len(monitors)
         monitor_obj.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
 
-        raw_history = r_client.get("control_plane:action_history")
-        if raw_history:
-            history = json.loads(raw_history)
+        history = r_client.get_latest_state("control_plane:action_history")
+        if history:
             for act in history:
                 act["timestamp"] = pd.to_datetime(act["timestamp"])
             engine_obj.action_history = history
             
-        raw_queue = r_client.get("control_plane:action_queue")
-        if raw_queue:
-            queue = json.loads(raw_queue)
+        queue = r_client.get_latest_state("control_plane:action_queue")
+        if queue:
             for q in queue:
                 q["timestamp"] = pd.to_datetime(q["timestamp"])
             engine_obj.action_queue = queue
 
-        raw_autoscale = r_client.get("control_plane:autoscale_state")
-        if raw_autoscale:
-            autoscale_state = json.loads(raw_autoscale)
+        autoscale_state = r_client.get_latest_state("control_plane:autoscale_state")
+        if autoscale_state:
             last_autoscale = autoscale_state.get("last_autoscale_time")
             engine_obj.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
     except Exception as e:
@@ -151,9 +147,9 @@ def _persist_control_plane_state(r_client, engine_obj, monitor_obj):
             "last_autoscale_time": engine_obj.last_autoscale_time.isoformat() if engine_obj.last_autoscale_time else None
         }
 
-        r_client.set("control_plane:action_history", json.dumps(serialized_history))
-        r_client.set("control_plane:action_queue", json.dumps(serialized_queue))
-        r_client.set("control_plane:autoscale_state", json.dumps(autoscale_state))
+        r_client.set_state("control_plane:action_history", serialized_history)
+        r_client.set_state("control_plane:action_queue", serialized_queue)
+        r_client.set_state("control_plane:autoscale_state", autoscale_state)
         r_client.delete("control_plane:active_monitors")
         if serialized_monitors:
             r_client.hset("control_plane:active_monitors", mapping={aid: json.dumps(mon) for aid, mon in serialized_monitors.items()})
@@ -273,7 +269,7 @@ def setup_consumer_group(r) -> None:
 def run_worker():
     # 1. Connect to Redis with retry loop
     r = None
-    import redis
+    from src.infrastructure.bus_factory import get_event_bus
     from urllib.parse import urlparse
     parsed_url = urlparse(settings.redis_url)
     detected_host = parsed_url.hostname or "127.0.0.1"
@@ -284,26 +280,7 @@ def run_worker():
             # Start WSL keepalive if connecting to WSL IP
             _start_wsl_keepalive(detected_host)
             
-            import socket
-            socket_keepalive_options = {}
-            if hasattr(socket, "TCP_KEEPIDLE"):
-                socket_keepalive_options[socket.TCP_KEEPIDLE] = 10
-            if hasattr(socket, "TCP_KEEPINTVL"):
-                socket_keepalive_options[socket.TCP_KEEPINTVL] = 5
-            if hasattr(socket, "TCP_KEEPCNT"):
-                socket_keepalive_options[socket.TCP_KEEPCNT] = 3
-
-            r = redis.from_url(
-                settings.redis_url,
-                decode_responses=True,
-                socket_connect_timeout=3,
-                socket_timeout=5,
-                socket_keepalive=True,
-                socket_keepalive_options=socket_keepalive_options,
-                retry_on_timeout=True,
-                health_check_interval=15,
-            )
-            r.ping()
+            r = get_event_bus()
             logger.info("Connected to Redis successfully!")
             break
         except Exception as e:

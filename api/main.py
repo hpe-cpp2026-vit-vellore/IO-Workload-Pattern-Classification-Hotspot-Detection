@@ -101,9 +101,9 @@ _stdlib_logging.getLogger("api.main").info(
 
 
 try:
-    import redis
-except ImportError:  # Redis server/client is optional because TCP fallback is supported.
-    redis = None
+    from src.infrastructure.bus_factory import get_event_bus
+except ImportError:
+    get_event_bus = None
 
 # Global engines
 hub: Optional[InferenceHub] = None
@@ -468,25 +468,7 @@ def _create_redis_client() -> Any:
     # Start WSL keepalive if connecting to WSL IP
     _start_wsl_keepalive(detected_host)
     
-    import socket
-    socket_keepalive_options = {}
-    if hasattr(socket, "TCP_KEEPIDLE"):
-        socket_keepalive_options[socket.TCP_KEEPIDLE] = 10
-    if hasattr(socket, "TCP_KEEPINTVL"):
-        socket_keepalive_options[socket.TCP_KEEPINTVL] = 5
-    if hasattr(socket, "TCP_KEEPCNT"):
-        socket_keepalive_options[socket.TCP_KEEPCNT] = 3
-
-    return redis.from_url(
-        settings.redis_url,
-        decode_responses=True,
-        socket_connect_timeout=3,
-        socket_timeout=5,
-        socket_keepalive=True,
-        socket_keepalive_options=socket_keepalive_options,
-        retry_on_timeout=True,
-        health_check_interval=15,
-    )
+    return get_event_bus()
 
 
 async def redis_stream_listener():
@@ -798,9 +780,8 @@ def _load_control_plane_state():
     # 2. Synchronize/Overwrite from Redis if active
     if use_redis and r is not None:
         try:
-            raw_history = r.get("control_plane:action_history")
-            if raw_history:
-                history = json.loads(raw_history)
+            history = r.get_latest_state("control_plane:action_history")
+            if history:
                 for act in history:
                     act["timestamp"] = pd.to_datetime(act["timestamp"])
                 if engine is not None:
@@ -820,16 +801,14 @@ def _load_control_plane_state():
                     monitor.total_actions = max(len(monitors), history_count)
                     monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
             
-            raw_queue = r.get("control_plane:action_queue")
-            if raw_queue and engine is not None:
-                queue = json.loads(raw_queue)
+            queue = r.get_latest_state("control_plane:action_queue")
+            if queue and engine is not None:
                 for q in queue:
                     q["timestamp"] = pd.to_datetime(q["timestamp"])
                 engine.action_queue = queue
 
-            raw_autoscale = r.get("control_plane:autoscale_state")
-            if raw_autoscale and engine is not None:
-                autoscale_state = json.loads(raw_autoscale)
+            autoscale_state = r.get_latest_state("control_plane:autoscale_state")
+            if autoscale_state and engine is not None:
                 last_autoscale = autoscale_state.get("last_autoscale_time")
                 engine.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
                 
@@ -891,9 +870,9 @@ def _persist_control_plane_state():
     # Save to Redis if available
     if use_redis and r is not None:
         try:
-            r.set("control_plane:action_history", json.dumps(serialized_history))
-            r.set("control_plane:action_queue", json.dumps(serialized_queue))
-            r.set("control_plane:autoscale_state", json.dumps(autoscale_state))
+            r.set_state("control_plane:action_history", serialized_history)
+            r.set_state("control_plane:action_queue", serialized_queue)
+            r.set_state("control_plane:autoscale_state", autoscale_state)
             r.delete("control_plane:active_monitors")
             if serialized_monitors:
                 r.hset("control_plane:active_monitors", mapping={aid: json.dumps(mon) for aid, mon in serialized_monitors.items()})
@@ -920,22 +899,19 @@ def _sync_monitors_from_redis():
         monitor.total_actions = max(len(monitors), history_count)
         monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
 
-        raw_history = r.get("control_plane:action_history")
-        if raw_history:
-            history = json.loads(raw_history)
+        history = r.get_latest_state("control_plane:action_history")
+        if history:
             for act in history:
                 act["timestamp"] = pd.to_datetime(act["timestamp"])
             engine.action_history = history
             
-        raw_queue = r.get("control_plane:action_queue")
-        if raw_queue:
-            queue = json.loads(raw_queue)
+        queue = r.get_latest_state("control_plane:action_queue")
+        if queue:
             for q in queue:
                 q["timestamp"] = pd.to_datetime(q["timestamp"])
             engine.action_queue = queue
-        raw_autoscale = r.get("control_plane:autoscale_state")
-        if raw_autoscale:
-            autoscale_state = json.loads(raw_autoscale)
+        autoscale_state = r.get_latest_state("control_plane:autoscale_state")
+        if autoscale_state:
             last_autoscale = autoscale_state.get("last_autoscale_time")
             engine.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
     except Exception as e:
@@ -981,7 +957,9 @@ async def action_monitor_loop():
 
             for aid in active_ids:
                 action = monitor.actions[aid]
-                vol_id = action["action_state"]["volume_id"]
+                vol_id = action["action_state"].get("volume_id")
+                if not vol_id:
+                    continue
 
                 current_latency = 0.0
                 live_event = live_state.latest_by_volume.get(vol_id)
@@ -1063,9 +1041,9 @@ async def startup_event():
 
     # Try to connect to Redis. If unavailable, the API owns a direct TCP fallback.
     redis_error = None
-    if redis is None:
+    if get_event_bus is None:
         use_redis = False
-        redis_error = "Python package 'redis' is not installed."
+        redis_error = "Event bus factory is unavailable (check if 'redis' package is installed)."
         logger.warning("%s Activating TCP fallback mode on port %s.", redis_error, TCP_FALLBACK_PORT)
     else:
         for attempt in range(1, redis_retry_attempts + 1):
