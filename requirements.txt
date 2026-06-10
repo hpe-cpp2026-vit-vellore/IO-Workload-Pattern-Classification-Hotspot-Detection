@@ -32,6 +32,8 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 requests>=2.31.0
 prometheus-fastapi-instrumentator==7.1.0
+pydantic-settings==2.14.1
+
 
 
 # Utilities

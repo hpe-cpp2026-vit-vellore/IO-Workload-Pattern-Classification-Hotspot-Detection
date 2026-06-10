@@ -26,6 +26,8 @@ if str(ANOMALY_DIR) not in sys.path:
 
 from src.control_plane import InferenceHub, Rebalancer, ActionMonitor, DecisionEngine
 from src.pipeline.telemetry_parser import parse_and_clip, load_or_create_bounds
+from configs.settings import settings
+
 
 def sync_topology_structure_from_redis(r_client, topology):
     try:
@@ -272,12 +274,15 @@ def run_worker():
     # 1. Connect to Redis with retry loop
     r = None
     import redis
+    from urllib.parse import urlparse
+    parsed_url = urlparse(settings.redis_url)
+    detected_host = parsed_url.hostname or "127.0.0.1"
     while True:
         try:
-            logger.info("Attempting to connect to Redis on %s:%s...", REDIS_HOST, REDIS_PORT)
+            logger.info("Attempting to connect to Redis on URL: %s...", settings.redis_url)
             
             # Start WSL keepalive if connecting to WSL IP
-            _start_wsl_keepalive(REDIS_HOST)
+            _start_wsl_keepalive(detected_host)
             
             import socket
             socket_keepalive_options = {}
@@ -288,9 +293,8 @@ def run_worker():
             if hasattr(socket, "TCP_KEEPCNT"):
                 socket_keepalive_options[socket.TCP_KEEPCNT] = 3
 
-            r = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
+            r = redis.from_url(
+                settings.redis_url,
                 decode_responses=True,
                 socket_connect_timeout=3,
                 socket_timeout=5,
@@ -304,10 +308,9 @@ def run_worker():
             break
         except Exception as e:
             logger.warning(
-                "Redis server not reachable at %s:%s: %s. Retrying in 5 seconds. "
+                "Redis server not reachable at %s: %s. Retrying in 5 seconds. "
                 "If you are using TCP fallback, this worker is not required; FastAPI handles ingestion directly.",
-                REDIS_HOST,
-                REDIS_PORT,
+                settings.redis_url,
                 e
             )
             time.sleep(5)

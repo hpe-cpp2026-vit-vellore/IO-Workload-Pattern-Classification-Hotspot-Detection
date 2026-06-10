@@ -24,6 +24,8 @@ from fastapi import FastAPI, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
+from configs.settings import settings
+
 
 
 # Add project root to sys.path
@@ -458,8 +460,10 @@ def get_expected_volume_count() -> Optional[int]:
 
 def _create_redis_client() -> Any:
     """Create a new Redis client with resilient WSL2-friendly settings."""
-    detected_host = _detect_redis_host()
-    logger.info("Creating Redis client targeting %s:%s", detected_host, REDIS_PORT)
+    from urllib.parse import urlparse
+    parsed_url = urlparse(settings.redis_url)
+    detected_host = parsed_url.hostname or "127.0.0.1"
+    logger.info("Creating Redis client targeting URL: %s", settings.redis_url)
     
     # Start WSL keepalive if connecting to WSL IP
     _start_wsl_keepalive(detected_host)
@@ -473,9 +477,8 @@ def _create_redis_client() -> Any:
     if hasattr(socket, "TCP_KEEPCNT"):
         socket_keepalive_options[socket.TCP_KEEPCNT] = 3
 
-    return redis.Redis(
-        host=detected_host,
-        port=REDIS_PORT,
+    return redis.from_url(
+        settings.redis_url,
         decode_responses=True,
         socket_connect_timeout=3,
         socket_timeout=5,

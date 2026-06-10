@@ -25,6 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
 # Logger setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] PlaybackAgent: %(message)s")
 logger = logging.getLogger("playback_agent")
+from configs.settings import settings
+
 
 PARQUET_PATH = PROJECT_ROOT / "data" / "processed" / "io_features.parquet"
 CSV_PATH = PROJECT_ROOT / "data" / "processed" / "io_features.csv"
@@ -156,9 +158,12 @@ def connect_redis():
     """Return a Redis client if a local Redis server is reachable."""
     try:
         import redis
+        from urllib.parse import urlparse
+        parsed_url = urlparse(settings.redis_url)
+        detected_host = parsed_url.hostname or "127.0.0.1"
         
         # Start WSL keepalive if connecting to WSL IP
-        _start_wsl_keepalive(REDIS_HOST)
+        _start_wsl_keepalive(detected_host)
         
         import socket
         socket_keepalive_options = {}
@@ -169,9 +174,8 @@ def connect_redis():
         if hasattr(socket, "TCP_KEEPCNT"):
             socket_keepalive_options[socket.TCP_KEEPCNT] = 3
 
-        client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
+        client = redis.from_url(
+            settings.redis_url,
             decode_responses=True,
             socket_connect_timeout=3,
             socket_timeout=5,
@@ -180,13 +184,12 @@ def connect_redis():
             health_check_interval=15,
         )
         client.ping()
-        logger.info("Connected to Redis server on %s:%s. Stream playback enabled.", REDIS_HOST, REDIS_PORT)
+        logger.info("Connected to Redis server on URL: %s. Stream playback enabled.", settings.redis_url)
         return client
     except Exception as e:
         logger.warning(
-            "Could not connect to Redis at %s:%s: %s. Falling back to TCP socket mode on %s:%s.",
-            REDIS_HOST,
-            REDIS_PORT,
+            "Could not connect to Redis at URL %s: %s. Falling back to TCP socket mode on %s:%s.",
+            settings.redis_url,
             e,
             TCP_FALLBACK_HOST,
             TCP_FALLBACK_PORT
