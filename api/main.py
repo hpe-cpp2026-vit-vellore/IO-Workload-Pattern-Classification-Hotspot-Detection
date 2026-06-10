@@ -20,11 +20,12 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 from typing import Dict, List, Any, Optional
-from fastapi import FastAPI, HTTPException, status, Query
+from fastapi import FastAPI, HTTPException, status, Query, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from configs.settings import settings
+from src.infrastructure.security import verify_admin_token, create_access_token
 
 
 
@@ -1157,6 +1158,22 @@ def validate_volume(volume_id: str):
 
 # --- API Routes ---
 
+from fastapi.security import OAuth2PasswordRequestForm
+
+@app.post("/token", tags=["Security"])
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    # In production, this would query a real Active Directory/LDAP database.
+    # For our architectural blueprint, we hardcode the master admin account.
+    if form_data.username != "admin" or form_data.password != "hpe_admin_2026":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token = create_access_token(data={"sub": form_data.username, "role": "hpe_storage_admin"})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
 @app.get("/health", status_code=status.HTTP_200_OK)
 def get_health():
     """Simple health check endpoint."""
@@ -1427,7 +1444,7 @@ def stream_volume_metrics(id: str):
 
 
 @app.get("/volumes/{id}/workload", status_code=status.HTTP_200_OK)
-def get_volume_workload(id: str):
+def get_volume_workload(id: str, current_user: str = Depends(verify_admin_token)):
     """Current workload pattern classification and confidence scores."""
     validate_volume(id)
     analysis = cached_analysis.get(id)
@@ -1528,7 +1545,7 @@ def get_volume_explanation(id: str):
 
 
 @app.get("/alerts", status_code=status.HTTP_200_OK)
-def get_alerts():
+def get_alerts(current_user: str = Depends(verify_admin_token)):
     """All active alerts sorted by severity (Policy & Latency aware)."""
     alerts = []
     
@@ -1605,7 +1622,7 @@ def get_noisy_neighbors():
     return noisy_pairs
 
 @app.get("/capacity/plan", status_code=status.HTTP_200_OK)
-def get_capacity_plan():
+def get_capacity_plan(current_user: str = Depends(verify_admin_token)):
     """Generates cluster-wide capacity planning and auto-scale recommendations."""
     if hub is None or capacity_planner is None:
         raise HTTPException(status_code=503, detail="Hub or Capacity Planner not initialized.")
@@ -1744,7 +1761,7 @@ def get_tier_headroom(tier_name: str):
 # --- What-If Simulator Endpoints ---
 
 @app.post("/simulate/capacity", status_code=status.HTTP_200_OK)
-def post_simulate_capacity(req: SimulateCapacityRequest):
+def post_simulate_capacity(req: SimulateCapacityRequest, current_user: str = Depends(verify_admin_token)):
     """Simulate adding storage capacity (GB) to a volume."""
     validate_volume(req.volume_id)
     sync_topology_from_redis()
@@ -1757,7 +1774,7 @@ def post_simulate_capacity(req: SimulateCapacityRequest):
 
 
 @app.post("/simulate/migrate", status_code=status.HTTP_200_OK)
-def post_simulate_migrate(req: SimulateMigrateRequest):
+def post_simulate_migrate(req: SimulateMigrateRequest, current_user: str = Depends(verify_admin_token)):
     """Simulate moving a volume to another storage node."""
     validate_volume(req.volume_id)
     sync_topology_from_redis()
@@ -1770,7 +1787,7 @@ def post_simulate_migrate(req: SimulateMigrateRequest):
 
 
 @app.post("/simulate/qos", status_code=status.HTTP_200_OK)
-def post_simulate_qos(req: SimulateQosRequest):
+def post_simulate_qos(req: SimulateQosRequest, current_user: str = Depends(verify_admin_token)):
     """Simulate capping a volume's IOPS limit."""
     validate_volume(req.volume_id)
     sync_topology_from_redis()
@@ -1783,7 +1800,7 @@ def post_simulate_qos(req: SimulateQosRequest):
 
 
 @app.post("/simulate/tier", status_code=status.HTTP_200_OK)
-def post_simulate_tier(req: SimulateTierRequest):
+def post_simulate_tier(req: SimulateTierRequest, current_user: str = Depends(verify_admin_token)):
     """Simulate upgrading or downgrading a volume's storage tier."""
     validate_volume(req.volume_id)
     sync_topology_from_redis()

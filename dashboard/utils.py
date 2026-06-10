@@ -194,10 +194,29 @@ def apply_dark_theme(fig):
     return fig
 
 # --- API Fetch wrappers ---
+@st.cache_data(ttl=3000) # Cache the token
+def _get_auth_token(api_url: str) -> str:
+    try:
+        response = requests.post(
+            f"{api_url}/token", 
+            data={"username": "admin", "password": "hpe_admin_2026"},
+            timeout=5.0
+        )
+        if response.status_code == 200:
+            return response.json().get("access_token")
+    except Exception:
+        pass
+    return ""
+
 def get_api_data(endpoint: str, params: dict = None, timeout: float = 5.0) -> Any:
     """Helper to query local FastAPI endpoints."""
     try:
-        response = requests.get(f"{API_URL}{endpoint}", params=params, timeout=timeout)
+        headers = {}
+        if not endpoint.startswith("/health"):
+            token = _get_auth_token(API_URL)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        response = requests.get(f"{API_URL}{endpoint}", params=params, headers=headers, timeout=timeout)
         if response.status_code == 200:
             st.session_state["last_api_error"] = None
             return response.json()
@@ -210,7 +229,12 @@ def get_api_data(endpoint: str, params: dict = None, timeout: float = 5.0) -> An
 def post_api_data(endpoint: str, payload: dict) -> Any:
     """Helper to post parameters to FastAPI endpoints."""
     try:
-        response = requests.post(f"{API_URL}{endpoint}", json=payload, timeout=5)
+        headers = {}
+        if not endpoint.startswith("/health"):
+            token = _get_auth_token(API_URL)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        response = requests.post(f"{API_URL}{endpoint}", json=payload, headers=headers, timeout=5)
         return response.json() if response.status_code == 200 else {"detail": response.text}
     except Exception as e:
         return {"detail": str(e)}
@@ -218,7 +242,12 @@ def post_api_data(endpoint: str, payload: dict) -> Any:
 def put_api_data(endpoint: str, payload: dict) -> Any:
     """Helper to update policy configurations at FastAPI endpoints."""
     try:
-        response = requests.put(f"{API_URL}{endpoint}", json=payload, timeout=5)
+        headers = {}
+        if not endpoint.startswith("/health"):
+            token = _get_auth_token(API_URL)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        response = requests.put(f"{API_URL}{endpoint}", json=payload, headers=headers, timeout=5)
         return response.json() if response.status_code == 200 else {"detail": response.text}
     except Exception as e:
         return {"detail": str(e)}
