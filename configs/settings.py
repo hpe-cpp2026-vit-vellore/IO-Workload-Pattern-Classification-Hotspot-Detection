@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # Security
     api_key_secret: str = "super-secret-local-key"
 
+    # Master Admin Credentials (Injected via K8s Secrets in Prod)
+    master_admin_user: str = "admin"
+    # Default bcrypt hash for "hpe_admin_2026" for local testing fallback
+    master_admin_hash: str = "$2b$12$acK8hg5SYIqP86ID8Ta.7u9QJ7kR8Kmmk3n6F.p8bfynL1PKBOaq."
+
     @classmethod
     def _detect_redis_host_local(cls) -> str:
         """Auto-detect the best Redis host address (handles WSL2 networking).

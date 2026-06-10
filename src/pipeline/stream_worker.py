@@ -175,7 +175,19 @@ def _persist_topology_to_redis_worker(r_client, hub_obj, volume_id: str):
         logger.error("Failed to persist topology to Redis for volume %s: %s", volume_id, e)
 
 # Logger setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] StreamWorker: %(message)s")
+import logging
+from pythonjsonlogger import jsonlogger
+
+logger = logging.getLogger()
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(levelname)s %(name)s %(message)s',
+    rename_fields={"asctime": "timestamp", "levelname": "level"}
+)
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
 logger = logging.getLogger("stream_worker")
 
 REDIS_PORT = 6379

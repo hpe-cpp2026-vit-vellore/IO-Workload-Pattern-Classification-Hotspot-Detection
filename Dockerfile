@@ -44,20 +44,20 @@ RUN apt-get update \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user for security.
-RUN useradd -r -m -u 10001 appuser
-
 WORKDIR /app
 
 # Ensure bin directory exists
 RUN mkdir -p /app/bin
 
 COPY --from=builder /install /usr/local
-COPY --chown=appuser:appuser . /app
+COPY --chown=1000:1000 . /app
 
 # Copy compiled binary
-COPY --from=builder --chown=appuser:appuser /build/cpp/telemetry_parser /app/bin/telemetry_parser
+COPY --from=builder --chown=1000:1000 /build/cpp/telemetry_parser /app/bin/telemetry_parser
 
+# Create a non-root user and change ownership
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000 8501

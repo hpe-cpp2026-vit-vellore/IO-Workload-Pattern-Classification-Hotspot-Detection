@@ -57,3 +57,8 @@ bcrypt<4.0.0
 # Testing Layer
 httpx>=0.24.0
 
+# Day-2 Operations Layer
+alembic==1.13.1
+python-json-logger==2.0.7
+
+

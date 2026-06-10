@@ -55,7 +55,19 @@ from api.schemas.models import (
 )
 
 # Logger setup
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+import logging
+from pythonjsonlogger import jsonlogger
+
+logger = logging.getLogger()
+logHandler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(levelname)s %(name)s %(message)s',
+    rename_fields={"asctime": "timestamp", "levelname": "level"}
+)
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
 logger = logging.getLogger("api.main")
 
 app = FastAPI(
@@ -1159,12 +1171,16 @@ def validate_volume(volume_id: str):
 # --- API Routes ---
 
 from fastapi.security import OAuth2PasswordRequestForm
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 @app.post("/token", tags=["Security"])
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     # In production, this would query a real Active Directory/LDAP database.
-    # For our architectural blueprint, we hardcode the master admin account.
-    if form_data.username != "admin" or form_data.password != "hpe_admin_2026":
+    # For our architectural blueprint, we verify using the Settings credentials.
+    if (form_data.username != settings.master_admin_user or 
+            not pwd_context.verify(form_data.password, settings.master_admin_hash)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
