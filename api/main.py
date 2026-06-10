@@ -997,7 +997,14 @@ async def startup_event():
     logger.info("Initializing Control Plane engines and loading ML models...")
     
     bounds = load_or_create_bounds(PROJECT_ROOT)
-    hub = InferenceHub(project_root=PROJECT_ROOT)
+    # --- Initialize ML Inference Layer ---
+    if settings.inference_mode == "remote":
+        from src.control_plane.remote_inference_client import RemoteInferenceClient
+        logger.info("Initializing Disaggregated Remote Inference Client...")
+        hub = RemoteInferenceClient(project_root=PROJECT_ROOT)
+    else:
+        logger.info("Initializing Local monolithic Inference Hub...")
+        hub = InferenceHub(project_root=PROJECT_ROOT)
     
     # Initialize monitor with safety watchdogs and circuit breakers
     monitor = ActionMonitor(
@@ -1018,7 +1025,10 @@ async def startup_event():
     )
     
     # Initialize SHAP explainer
-    explainer = shap.TreeExplainer(hub.classifier)
+    if hub.classifier is not None:
+        explainer = shap.TreeExplainer(hub.classifier)
+    else:
+        explainer = None
 
     # Wire expected volume count for complete-tick tracking
     expected_count = get_expected_volume_count()

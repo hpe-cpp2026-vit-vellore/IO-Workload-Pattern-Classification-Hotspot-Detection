@@ -292,10 +292,15 @@ def run_worker():
             )
             time.sleep(5)
 
-    # 2. Initialize InferenceHub
-    logger.info("Initializing InferenceHub and loading ML models...")
-    hub = InferenceHub(project_root=PROJECT_ROOT)
-    logger.info("InferenceHub initialized successfully.")
+    # 2. Initialize ML serving layer
+    if settings.inference_mode == "remote":
+        from src.control_plane.remote_inference_client import RemoteInferenceClient
+        logger.info("Initializing Disaggregated Remote Inference Client...")
+        hub = RemoteInferenceClient(project_root=PROJECT_ROOT)
+    else:
+        logger.info("Initializing Local monolithic Inference Hub...")
+        hub = InferenceHub(project_root=PROJECT_ROOT)
+    logger.info("ML serving layer initialized successfully.")
 
     # Initialize telemetry outlier bounds
     bounds = load_or_create_bounds(PROJECT_ROOT)

@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     kafka_brokers: str = "kafka-cluster:9092"
     
+    # ML Serving Architecture
+    inference_mode: Literal["local", "remote"] = "local"
+    
     # Security
     api_key_secret: str = "super-secret-local-key"
 
