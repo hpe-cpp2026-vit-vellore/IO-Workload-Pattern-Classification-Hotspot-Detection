@@ -1014,8 +1014,11 @@ async def startup_event():
         max_rollback_rate_pct=1.0   # Success Criteria 4 threshold
     )
     
-    # Wire StubActuator into Rebalancer to execute simulated move phases
-    actuator = get_actuator("stub", monitor, speed_up=100.0)
+    # Wire CSIActuator in production, or fallback to StubActuator in development/testing
+    if settings.environment == "production":
+        actuator = get_actuator("csi", monitor)
+    else:
+        actuator = get_actuator("stub", monitor, speed_up=100.0)
     rebalancer = Rebalancer(actuator=actuator)
     
     engine = DecisionEngine(hub, rebalancer, monitor)

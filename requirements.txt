@@ -46,4 +46,7 @@ confluent-kafka==2.14.2
 psycopg2-binary>=2.9.9
 SQLAlchemy>=2.0.30
 
+# Kubernetes API Layer
+kubernetes>=29.0.0
+
 
