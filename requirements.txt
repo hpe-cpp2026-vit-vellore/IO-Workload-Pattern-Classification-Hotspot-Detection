@@ -42,3 +42,8 @@ tqdm>=4.60.0
 redis>=5.0.1
 confluent-kafka==2.14.2
 
+# Database Layer
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.30
+
+

@@ -213,6 +213,12 @@ class NoisyNeighborDetector:
         if not neighbors:
             return None
 
+        # If TimescaleDB is configured, fetch neighbor metrics dynamically to avoid loading all features into memory
+        if hasattr(self, "db_client") and self.db_client:
+            df_metrics = self.db_client.get_neighbors_metrics(neighbors + [aggressor_id], timestamp)
+            for row in df_metrics.itertuples(index=False):
+                self._lookup_dict[(timestamp, str(row.volume_id))] = (float(row.avg_latency_us), float(row.total_iops))
+
         # Aggressor metrics — default to 0.0 if timestamp not in index.
         agg = self._lookup_dict.get((timestamp, aggressor_id), (0.0, 0.0))
 

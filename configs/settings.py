@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     # ML Serving Architecture
     inference_mode: Literal["local", "remote"] = "local"
     
+    # Database Architecture
+    db_type: Literal["local", "timescaledb"] = "local"
+    timescale_dsn: str = "postgresql://user:password@timescaledb:5432/hpe_metrics"
+    
     # Security
     api_key_secret: str = "super-secret-local-key"
 

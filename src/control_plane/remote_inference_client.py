@@ -26,30 +26,41 @@ class RemoteInferenceClient:
         with open(policy_path, "r") as f:
             self.policy = yaml.safe_load(f)
 
-        # Load dataset for features and topology
-        features_pq = self.project_root / "data" / "processed" / "io_features.parquet"
-        if not features_pq.exists():
-            features_pq = self.project_root / "data" / "processed" / "io_features.csv"
-        
-        if features_pq.exists():
-            if features_pq.suffix == ".parquet":
-                self.features_df = pd.read_parquet(features_pq)
+        from configs.settings import settings
+
+        self.features_df = pd.DataFrame()
+        self._historical_vols = {}
+
+        if settings.db_type == "local":
+            # Load dataset for features and topology
+            features_pq = self.project_root / "data" / "processed" / "io_features.parquet"
+            if not features_pq.exists():
+                features_pq = self.project_root / "data" / "processed" / "io_features.csv"
+            
+            if features_pq.exists():
+                if features_pq.suffix == ".parquet":
+                    self.features_df = pd.read_parquet(features_pq)
+                else:
+                    self.features_df = pd.read_csv(features_pq)
             else:
-                self.features_df = pd.read_csv(features_pq)
-        else:
-            # Fallback
-            csv_path = self.project_root / "dataset_overview.csv"
-            self.features_df = pd.read_csv(csv_path) if csv_path.exists() else pd.DataFrame()
+                # Fallback
+                csv_path = self.project_root / "dataset_overview.csv"
+                self.features_df = pd.read_csv(csv_path) if csv_path.exists() else pd.DataFrame()
 
-        if not self.features_df.empty:
-            self.features_df["timestamp"] = pd.to_datetime(self.features_df["timestamp"])
-            self._historical_vols = dict(tuple(self.features_df.groupby("volume_id")))
-            self.topology = TopologyGraph.from_dataframe(self.features_df)
-        else:
-            self._historical_vols = {}
-            self.topology = None
-
-        self.live_features_df = pd.DataFrame(columns=self.features_df.columns)
+            if not self.features_df.empty:
+                self.features_df["timestamp"] = pd.to_datetime(self.features_df["timestamp"])
+                self._historical_vols = dict(tuple(self.features_df.groupby("volume_id")))
+                self.topology = TopologyGraph.from_dataframe(self.features_df)
+            else:
+                self._historical_vols = {}
+                self.topology = None
+            self.live_features_df = pd.DataFrame(columns=self.features_df.columns)
+        elif settings.db_type == "timescaledb":
+            from src.infrastructure.timescale_client import TimescaleClient
+            self.db_client = TimescaleClient()
+            topo_df = self.db_client.get_topology_data()
+            self.topology = TopologyGraph.from_dataframe(topo_df)
+            self.live_features_df = pd.DataFrame()
 
         # Load light classifier & scaler for SHAP explainability
         classifier_path = self.project_root / "models" / "classifier" / "lightgbm_tuned_model.pkl"
@@ -63,7 +74,15 @@ class RemoteInferenceClient:
         self.live_features_df = pd.concat([self.live_features_df, df]).drop_duplicates(subset=["volume_id", "timestamp"], keep="last")
 
     def get_volume_features(self, volume_id: str) -> pd.DataFrame:
-        df_hist = self._historical_vols.get(volume_id, pd.DataFrame(columns=self.features_df.columns))
+        from configs.settings import settings
+        
+        # 1. Fetch Historical Data dynamically
+        if settings.db_type == "timescaledb":
+            df_hist = self.db_client.get_historical_features(volume_id)
+        else:
+            df_hist = self._historical_vols.get(volume_id, pd.DataFrame(columns=self.features_df.columns))
+            
+        # 2. Append Live Data Buffer
         if not self.live_features_df.empty:
             df_live = self.live_features_df[self.live_features_df["volume_id"] == volume_id]
             if not df_live.empty:
@@ -84,6 +103,8 @@ class RemoteInferenceClient:
         ids = set(self.features_df["volume_id"].unique()) if not self.features_df.empty else set()
         if not self.live_features_df.empty:
             ids.update(self.live_features_df["volume_id"].unique())
+        if self.topology:
+            ids.update(self.topology.all_volumes())
         return ids
 
     def fast_hotspot_score(self, volume_id: str, timestamp: pd.Timestamp) -> float:

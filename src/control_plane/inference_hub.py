@@ -113,28 +113,35 @@ class InferenceHub:
         with open(policy_path, "r") as f:
             self.policy = yaml.safe_load(f)
 
-        # Load raw data once to calibrate scalers and fit baselines
-        features_pq = self.project_root / "data" / "processed" / "io_features.parquet"
-        if not features_pq.exists():
-            features_pq = self.project_root / "data" / "processed" / "io_features.csv"
-        
-        if features_pq.suffix == ".parquet":
-            self.features_df = pd.read_parquet(features_pq)
-        else:
-            self.features_df = pd.read_csv(features_pq)
+        from configs.settings import settings
 
-        self.features_df["timestamp"] = pd.to_datetime(self.features_df["timestamp"])
-        
-        # --- NEW OPTIMIZATION: O(1) Historical Lookup ---
-        self._historical_vols = dict(tuple(self.features_df.groupby("volume_id")))
-        # ---
+        self.features_df = pd.DataFrame()
+        self._historical_vols = {}
 
-        # Live features buffer: populated by API's _append_feature_rows.
-        # Kept separate from the immutable historical snapshot.
-        self.live_features_df = pd.DataFrame(columns=self.features_df.columns)
-        
-        # Topology
-        self.topology = TopologyGraph.from_dataframe(self.features_df)
+        if settings.db_type == "local":
+            # Load raw data once to calibrate scalers and fit baselines
+            features_pq = self.project_root / "data" / "processed" / "io_features.parquet"
+            if not features_pq.exists():
+                features_pq = self.project_root / "data" / "processed" / "io_features.csv"
+            
+            if features_pq.suffix == ".parquet":
+                self.features_df = pd.read_parquet(features_pq)
+            else:
+                self.features_df = pd.read_csv(features_pq)
+
+            self.features_df["timestamp"] = pd.to_datetime(self.features_df["timestamp"])
+            
+            # --- NEW OPTIMIZATION: O(1) Historical Lookup ---
+            self._historical_vols = dict(tuple(self.features_df.groupby("volume_id")))
+            # ---
+            self.live_features_df = pd.DataFrame(columns=self.features_df.columns)
+            self.topology = TopologyGraph.from_dataframe(self.features_df)
+        elif settings.db_type == "timescaledb":
+            from src.infrastructure.timescale_client import TimescaleClient
+            self.db_client = TimescaleClient()
+            topo_df = self.db_client.get_topology_data()
+            self.topology = TopologyGraph.from_dataframe(topo_df)
+            self.live_features_df = pd.DataFrame()
 
         # Classifier & its Scaler
         classifier_path = self.project_root / "models" / "classifier" / "lightgbm_tuned_model.pkl"
@@ -166,8 +173,23 @@ class InferenceHub:
             latency_z_threshold=2.0,
             iops_z_threshold=1.0,
         )
-        self.noisy_neighbor.fit_baselines(self.features_df)
-        self.noisy_neighbor.index_features(self.features_df)
+        if settings.db_type == "local":
+            self.noisy_neighbor.fit_baselines(self.features_df)
+            self.noisy_neighbor.index_features(self.features_df)
+        elif settings.db_type == "timescaledb":
+            self.noisy_neighbor.db_client = self.db_client
+            baselines_df = self.db_client.get_noisy_neighbor_baselines()
+            if not baselines_df.empty:
+                mn = self.noisy_neighbor._MIN_STD
+                mbs = self.noisy_neighbor.min_baseline_samples
+                bl = {}
+                for row in baselines_df.itertuples(index=False):
+                    if min(int(row.lat_n), int(row.iops_n)) < mbs:
+                        continue
+                    lat_std = float(row.lat_std) if pd.notna(row.lat_std) and row.lat_std > mn else mn
+                    iops_std = float(row.iops_std) if pd.notna(row.iops_std) and row.iops_std > mn else mn
+                    bl[str(row.volume_id)] = (float(row.lat_mean), lat_std, float(row.iops_mean), iops_std)
+                self.noisy_neighbor._baselines = bl
 
         # N-BEATS Capacity Forecaster
         nbeats_path = self.project_root / "models" / "forecasting" / "nbeats_model.pth"
@@ -184,9 +206,29 @@ class InferenceHub:
         self.nbeats.eval()
 
         # TFT Data Preparation (returns scaled features/targets and fitted scaler)
-        self.tft_features, self.tft_targets, self.tft_scaler = prepare_hourly_latency(
-            self.features_df, val_hours=72
-        )
+        scaler_save_path = self.project_root / "models" / "forecasting" / "tft_scaler.pkl"
+        if settings.db_type == "local":
+            if scaler_save_path.exists():
+                self.tft_scaler = joblib.load(scaler_save_path)
+                self.tft_features, self.tft_targets, _ = prepare_hourly_latency(
+                    self.features_df, val_hours=72
+                )
+            else:
+                self.tft_features, self.tft_targets, self.tft_scaler = prepare_hourly_latency(
+                    self.features_df, val_hours=72
+                )
+                joblib.dump(self.tft_scaler, scaler_save_path)
+                logger.info(f"Fitted and saved TFT scaler to {scaler_save_path}")
+        elif settings.db_type == "timescaledb":
+            if scaler_save_path.exists():
+                self.tft_scaler = joblib.load(scaler_save_path)
+                logger.info(f"Loaded TFT scaler from {scaler_save_path}")
+            else:
+                from sklearn.preprocessing import StandardScaler
+                self.tft_scaler = StandardScaler()
+                logger.warning(f"TFT scaler not found at {scaler_save_path}. Initialized empty scaler.")
+            self.tft_features = {}
+            self.tft_targets = {}
 
         # TFT Tail Latency Forecaster
         tft_path = self.project_root / "models" / "forecasting" / "tft_model.pth"
@@ -220,7 +262,7 @@ class InferenceHub:
         - Topology graph
         This is the authoritative set for API volume validation.
         """
-        ids = set(self.features_df["volume_id"].unique())
+        ids = set(self.features_df["volume_id"].unique()) if not self.features_df.empty else set()
         if not self.live_features_df.empty:
             ids.update(self.live_features_df["volume_id"].unique())
         ids.update(self.topology.all_volumes())
@@ -258,9 +300,14 @@ class InferenceHub:
 
     def get_volume_features(self, volume_id: str) -> pd.DataFrame:
         """ULTRA-OPTIMIZED: Extract and merge features ONLY for the requested volume."""
-        # 1. O(1) lookup for historical data
-        df_hist = self._historical_vols.get(volume_id, pd.DataFrame(columns=self.features_df.columns))
+        from configs.settings import settings
         
+        # 1. Fetch Historical Data dynamically
+        if settings.db_type == "timescaledb":
+            df_hist = self.db_client.get_historical_features(volume_id)
+        else:
+            df_hist = self._historical_vols.get(volume_id, pd.DataFrame(columns=self.features_df.columns))
+            
         # 2. Filter live data for this specific volume
         if not self.live_features_df.empty:
             df_live = self.live_features_df[self.live_features_df["volume_id"] == volume_id]
