@@ -1,0 +1,25 @@
+{{/*
+service-monitor.yaml — Prometheus Operator ServiceMonitor CRD
+Migrated from deploy/k8s/04-service-monitor.yaml
+Only deployed if metrics.serviceMonitor.enabled is true in values.yaml
+*/}}
+{{- if .Values.metrics.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Release.Name }}-api-servicemonitor
+  labels:
+    app: hpe-api
+    chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    release: {{ .Values.metrics.serviceMonitor.releaseLabel }}
+spec:
+  selector:
+    matchLabels:
+      app: hpe-api
+      release: {{ .Release.Name }}
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: {{ .Values.metrics.serviceMonitor.interval }}
+    scheme: http
+{{- end }}

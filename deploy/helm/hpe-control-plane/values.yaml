@@ -1,0 +1,85 @@
+# =============================================================================
+# HPE Control Plane — Helm Values (Production Defaults)
+# =============================================================================
+# These values reflect the true resource requirements of our ML control plane.
+# The API loads heavy PyTorch models (N-BEATS, TFT) and LightGBM classifiers
+# into memory at startup, requiring a minimum of 2Gi RAM (4Gi limit).
+# =============================================================================
+
+replicaCount: 3
+
+image:
+  repository: hpe-control-plane
+  pullPolicy: IfNotPresent
+  tag: "prod"
+
+# =============================================================================
+# Application Configuration
+# =============================================================================
+# These map directly to environment variables consumed by configs/settings.py
+# via pydantic-settings. The field names are the UPPER_SNAKE_CASE env vars:
+#   ENVIRONMENT, BUS_TYPE, INFERENCE_MODE, DB_TYPE, REDIS_URL, TIMESCALE_DSN, API_KEY_SECRET
+# =============================================================================
+environment: "production"
+
+config:
+  busType: "kafka"
+  dbType: "timescaledb"
+  inferenceMode: "remote"
+  # K8s Secret containing REDIS_URL, TIMESCALE_DSN, and API_KEY_SECRET
+  existingSecret: "hpe-storage-secrets"
+
+# =============================================================================
+# Networking
+# =============================================================================
+# The existing static manifest maps external port 80 → internal port 8000.
+# We preserve this exact mapping to avoid breaking ingress/dashboard references.
+# =============================================================================
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+# =============================================================================
+# Container Resources (ML Workload Allocations)
+# =============================================================================
+# WARNING: Do NOT reduce memory limits below 2Gi.
+# InferenceHub loads: PyTorch N-BEATS (.pth), TFT (.pth), LightGBM (.pkl),
+# Anomaly Ensemble (.pkl), RobustScaler (.pkl), Parquet DataFrames.
+# OOMKill is guaranteed at < 1Gi under production inference load.
+# =============================================================================
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2000m"
+    memory: "4Gi"
+
+# =============================================================================
+# Horizontal Pod Autoscaler
+# =============================================================================
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 50
+  targetCPUUtilizationPercentage: 75
+
+# =============================================================================
+# Observability — Prometheus ServiceMonitor
+# =============================================================================
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 10s
+    # Standard enterprise label hook for prometheus-operator discovery
+    releaseLabel: "prometheus-operator"
+
+# =============================================================================
+# Security Context (mirrors Dockerfile USER appuser UID 1000)
+# =============================================================================
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000

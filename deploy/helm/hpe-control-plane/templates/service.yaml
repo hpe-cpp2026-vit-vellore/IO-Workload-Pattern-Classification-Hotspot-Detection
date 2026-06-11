@@ -1,0 +1,22 @@
+{{/*
+service.yaml — HPE Control Plane API Service
+Migrated from deploy/k8s/01-api-deployment.yaml (Service section)
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-api-service
+  labels:
+    app: hpe-api
+    chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+    release: {{ .Release.Name }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: hpe-api
+    release: {{ .Release.Name }}
+  ports:
+    - protocol: TCP
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      name: http

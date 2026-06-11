@@ -1,0 +1,6 @@
+apiVersion: v2
+name: hpe-control-plane
+description: Production-grade Helm chart for the HPE IO Workload & Hotspot Control Plane
+type: application
+version: 1.0.0
+appVersion: "2026.1.0"
