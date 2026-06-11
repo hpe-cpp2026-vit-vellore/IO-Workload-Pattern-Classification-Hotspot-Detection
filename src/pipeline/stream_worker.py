@@ -361,116 +361,141 @@ def run_worker():
                 last_ts = None
                 
                 for msg_id, fields in messages:
-                    # Clean/parse values from Redis string fields using the C++ parser or Python fallback
+                    # --- DLQ-Hardened Message Processing ---
+                    # Wrap the entire per-message pipeline in a try/except.
+                    # If ANY stage fails, the raw payload is routed to the
+                    # Dead-Letter Queue for offline forensic inspection,
+                    # the message is acknowledged to prevent infinite
+                    # redelivery (poison pill), and we continue to the next.
+                    raw_payload_str = json.dumps(fields)  # Capture raw payload before any mutation
+
                     try:
-                        json_str = json.dumps(fields)
-                        event = parse_and_clip(json_str, bounds)
-                    except Exception as e:
-                        logger.error(f"Failed to parse and clip message {msg_id}: {e}")
-                        pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
-                        continue
+                        # Clean/parse values from Redis string fields using the C++ parser or Python fallback
+                        try:
+                            event = parse_and_clip(raw_payload_str, bounds)
+                        except Exception as e:
+                            logger.error(f"Failed to parse and clip message {msg_id}: {e}")
+                            r.publish_dlq(raw_payload_str, f"parse_and_clip failure: {e}")
+                            pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
+                            continue
 
-                    # Ensure type/fallback safety for all columns to not break downstream components
-                    STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
-                    for k, v in list(event.items()):
-                        if k in STRING_COLS:
-                            event[k] = str(v) if v is not None else ""
-                        elif v is None or v == "" or v == "None" or v == "NaN" or v == "nan":
-                            event[k] = 0.0
-                        else:
-                            try:
-                                event[k] = float(v)
-                            except (ValueError, TypeError):
+                        # Ensure type/fallback safety for all columns to not break downstream components
+                        STRING_COLS = {"volume_id", "node_id", "timestamp", "workload_label"}
+                        for k, v in list(event.items()):
+                            if k in STRING_COLS:
+                                event[k] = str(v) if v is not None else ""
+                            elif v is None or v == "" or v == "None" or v == "NaN" or v == "nan":
                                 event[k] = 0.0
+                            else:
+                                try:
+                                    event[k] = float(v)
+                                except (ValueError, TypeError):
+                                    event[k] = 0.0
 
-                    volume_id = event.get("volume_id")
-                    timestamp_str = event.get("timestamp")
+                        volume_id = event.get("volume_id")
+                        timestamp_str = event.get("timestamp")
 
-                    if not volume_id or not timestamp_str:
-                        # Invalid event format
+                        if not volume_id or not timestamp_str:
+                            # Invalid event format — route to DLQ
+                            r.publish_dlq(raw_payload_str, "Missing required field: volume_id or timestamp")
+                            pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
+                            continue
+
+                        # Parse timestamp to pandas Timestamp
+                        ts = pd.to_datetime(timestamp_str)
+                        event["timestamp"] = ts
+                        if last_ts is None or ts > last_ts:
+                            last_ts = ts
+                        
+                        # Detect telemetry playback reset (time jumping backward >30 min)
+                        if last_processed_ts is not None and ts < last_processed_ts - pd.Timedelta(minutes=30):
+                            logger.warning(
+                                "Telemetry playback reset detected (event ts=%s << last=%s). "
+                                "Clearing stale hotspot start times and action queue.",
+                                ts, last_processed_ts
+                            )
+                            engine.hotspot_start_times.clear()
+                            engine.action_queue.clear()
+                            last_processed_ts = ts
+                        elif last_processed_ts is None or ts > last_processed_ts:
+                            last_processed_ts = ts
+
+                        # A. Update local live features dataframe for time-series context
+                        new_row = pd.DataFrame([event])
+                        common_cols = [c for c in hub.features_df.columns if c in new_row.columns]
+                        new_row = new_row[common_cols]
+                        hub.live_features_df = pd.concat([hub.live_features_df, new_row], ignore_index=True)
+
+                        # B. Update topology metrics
+                        hub.topology.update_volume_metrics(volume_id, event)
+
+                        # C. Run real-time inference (Workload classification & anomaly detection)
+                        now = time.time()
+                        should_analyze = (volume_id not in last_analyzed_time or (now - last_analyzed_time[volume_id] >= 30.0))
+                        
+                        analysis = None
+                        if should_analyze:
+                            try:
+                                analysis = hub.analyze_volume(volume_id, ts)
+                                last_analyzed_time[volume_id] = now
+                            except Exception as ex:
+                                logger.error(f"Inference failed for {volume_id} at {timestamp_str}: {ex}")
+                                analysis = {
+                                    "volume_id": volume_id,
+                                    "timestamp": timestamp_str,
+                                    "workload_type": "Unknown",
+                                    "hotspot_score": 0.0,
+                                    "noisy_neighbor_victims": {},
+                                    "days_to_fill": {"warning_85pct_days": None, "critical_95pct_days": None},
+                                    "bandwidth_forecast_24h": {"p50_latency_us": [], "p90_latency_us": [], "p95_latency_us": []},
+                                    "latency_risk_score": 0.0
+                                }
+
+                        # D. Write latest state to Redis Hashes
+                        metric_fields = {k: str(v) for k, v in event.items() if k != "timestamp"}
+                        metric_fields["timestamp"] = timestamp_str
+                        
+                        pipe.hset(f"volume:{volume_id}:metrics", mapping=metric_fields)
+                        if analysis is not None:
+                            pipe.hset(f"volume:{volume_id}:analysis", "data", json.dumps(analysis))
+
+                            # Evaluate volume in DecisionEngine
+                            try:
+                                action_result = engine.evaluate_volume(volume_id, ts, analysis)
+                                if action_result:
+                                    status = action_result.get("status")
+                                    if status in ("executed", "queued"):
+                                        _persist_control_plane_state(r, engine, monitor)
+                                        _persist_topology_to_redis_worker(r, hub, volume_id)
+                            except Exception as ex:
+                                logger.error(f"Decision engine evaluation failed for {volume_id} at {timestamp_str}: {ex}")
+
+                        # E. Write to history list (rolling window of last 100 entries per volume)
+                        # Serializing timestamp as string
+                        history_event = dict(event)
+                        history_event["timestamp"] = timestamp_str
+                        history_json = json.dumps(history_event)
+                        
+                        pipe.lpush(f"volume:{volume_id}:history", history_json)
+                        pipe.ltrim(f"volume:{volume_id}:history", 0, 99)
+
+                        # F. Acknowledge message processing completion
+                        pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
+
+                    except Exception as poison_err:
+                        # --- POISON PILL CATCH-ALL ---
+                        # Any uncaught exception in the processing pipeline lands here.
+                        # Route to DLQ, acknowledge to prevent infinite redelivery, continue.
+                        logger.error(
+                            "Poison pill detected for message %s: %s. Routing to DLQ.",
+                            msg_id, poison_err
+                        )
+                        try:
+                            r.publish_dlq(raw_payload_str, f"Uncaught processing error: {poison_err}")
+                        except Exception:
+                            pass  # DLQ publish itself failed; already logged inside publish_dlq
                         pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
                         continue
-
-                    # Parse timestamp to pandas Timestamp
-                    ts = pd.to_datetime(timestamp_str)
-                    event["timestamp"] = ts
-                    if last_ts is None or ts > last_ts:
-                        last_ts = ts
-                    
-                    # Detect telemetry playback reset (time jumping backward >30 min)
-                    if last_processed_ts is not None and ts < last_processed_ts - pd.Timedelta(minutes=30):
-                        logger.warning(
-                            "Telemetry playback reset detected (event ts=%s << last=%s). "
-                            "Clearing stale hotspot start times and action queue.",
-                            ts, last_processed_ts
-                        )
-                        engine.hotspot_start_times.clear()
-                        engine.action_queue.clear()
-                        last_processed_ts = ts
-                    elif last_processed_ts is None or ts > last_processed_ts:
-                        last_processed_ts = ts
-
-                    # A. Update local live features dataframe for time-series context
-                    new_row = pd.DataFrame([event])
-                    common_cols = [c for c in hub.features_df.columns if c in new_row.columns]
-                    new_row = new_row[common_cols]
-                    hub.live_features_df = pd.concat([hub.live_features_df, new_row], ignore_index=True)
-
-                    # B. Update topology metrics
-                    hub.topology.update_volume_metrics(volume_id, event)
-
-                    # C. Run real-time inference (Workload classification & anomaly detection)
-                    now = time.time()
-                    should_analyze = (volume_id not in last_analyzed_time or (now - last_analyzed_time[volume_id] >= 30.0))
-                    
-                    analysis = None
-                    if should_analyze:
-                        try:
-                            analysis = hub.analyze_volume(volume_id, ts)
-                            last_analyzed_time[volume_id] = now
-                        except Exception as ex:
-                            logger.error(f"Inference failed for {volume_id} at {timestamp_str}: {ex}")
-                            analysis = {
-                                "volume_id": volume_id,
-                                "timestamp": timestamp_str,
-                                "workload_type": "Unknown",
-                                "hotspot_score": 0.0,
-                                "noisy_neighbor_victims": {},
-                                "days_to_fill": {"warning_85pct_days": None, "critical_95pct_days": None},
-                                "bandwidth_forecast_24h": {"p50_latency_us": [], "p90_latency_us": [], "p95_latency_us": []},
-                                "latency_risk_score": 0.0
-                            }
-
-                    # D. Write latest state to Redis Hashes
-                    metric_fields = {k: str(v) for k, v in event.items() if k != "timestamp"}
-                    metric_fields["timestamp"] = timestamp_str
-                    
-                    pipe.hset(f"volume:{volume_id}:metrics", mapping=metric_fields)
-                    if analysis is not None:
-                        pipe.hset(f"volume:{volume_id}:analysis", "data", json.dumps(analysis))
-
-                        # Evaluate volume in DecisionEngine
-                        try:
-                            action_result = engine.evaluate_volume(volume_id, ts, analysis)
-                            if action_result:
-                                status = action_result.get("status")
-                                if status in ("executed", "queued"):
-                                    _persist_control_plane_state(r, engine, monitor)
-                                    _persist_topology_to_redis_worker(r, hub, volume_id)
-                        except Exception as ex:
-                            logger.error(f"Decision engine evaluation failed for {volume_id} at {timestamp_str}: {ex}")
-
-                    # E. Write to history list (rolling window of last 100 entries per volume)
-                    # Serializing timestamp as string
-                    history_event = dict(event)
-                    history_event["timestamp"] = timestamp_str
-                    history_json = json.dumps(history_event)
-                    
-                    pipe.lpush(f"volume:{volume_id}:history", history_json)
-                    pipe.ltrim(f"volume:{volume_id}:history", 0, 99)
-
-                    # F. Acknowledge message processing completion
-                    pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
 
                 if last_ts is not None:
                     try:

@@ -46,6 +46,34 @@ class RedisBus(EventBus):
     def set_state(self, key: str, state: Dict[str, Any]) -> None:
         self.client.set(key, json.dumps(state))
 
+    def publish_dlq(self, payload: str, error: str) -> None:
+        """Publish failed payload to a dedicated Redis DLQ stream.
+        
+        Uses MAXLEN ~10000 to cap memory growth. Messages can be inspected
+        via `redis-cli XRANGE hpe_telemetry_dlq - +`.
+        """
+        if not self.client:
+            return
+        try:
+            import logging
+            import pandas as pd
+            self.client.xadd(
+                "hpe_telemetry_dlq",
+                {
+                    "payload": payload,
+                    "error": str(error),
+                    "timestamp": str(pd.Timestamp.now()),
+                },
+                maxlen=10000,
+            )
+            logging.getLogger("redis_bus").info(
+                "Published poison message to DLQ stream 'hpe_telemetry_dlq'"
+            )
+        except Exception as dlq_err:
+            logging.getLogger("redis_bus").error(
+                "Failed to publish to Redis DLQ: %s", dlq_err
+            )
+
     def __getattr__(self, name: str) -> Any:
         """Delegate missing attributes/methods to the underlying Redis client."""
         if self.client is not None:

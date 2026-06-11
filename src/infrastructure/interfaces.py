@@ -26,3 +26,13 @@ class EventBus(ABC):
     def set_state(self, key: str, state: Dict[str, Any]) -> None:
         """Cache a state object."""
         pass
+
+    @abstractmethod
+    def publish_dlq(self, payload: str, error: str) -> None:
+        """Publish a failed/poison message to the Dead-Letter Queue for offline inspection.
+        
+        Args:
+            payload: The raw message payload that caused the failure (JSON string).
+            error: The error message or traceback describing the failure.
+        """
+        pass

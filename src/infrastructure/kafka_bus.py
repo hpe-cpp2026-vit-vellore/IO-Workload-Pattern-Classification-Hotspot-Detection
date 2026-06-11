@@ -70,3 +70,32 @@ class KafkaBus(EventBus):
         self._state_cache[key] = state
         self.producer.produce(topic="hpe-control-plane-state", key=key, value=json.dumps(state))
         self.producer.flush()
+
+    def publish_dlq(self, payload: str, error: str) -> None:
+        """Publish failed payload to a dedicated Kafka DLQ topic.
+        
+        Messages are published to 'hpe_telemetry_dlq' topic for offline
+        inspection and forensic debugging.
+        """
+        if not self.producer:
+            return
+        try:
+            import logging
+            import pandas as pd
+            dlq_message = json.dumps({
+                "payload": payload,
+                "error": str(error),
+                "timestamp": str(pd.Timestamp.now()),
+            })
+            self.producer.produce(
+                "hpe_telemetry_dlq",
+                value=dlq_message.encode("utf-8"),
+            )
+            self.producer.poll(0)
+            logging.getLogger("kafka_bus").info(
+                "Published poison message to DLQ topic 'hpe_telemetry_dlq'"
+            )
+        except Exception as dlq_err:
+            logging.getLogger("kafka_bus").error(
+                "Failed to publish to Kafka DLQ: %s", dlq_err
+            )
