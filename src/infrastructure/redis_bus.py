@@ -32,6 +32,12 @@ class RedisBus(EventBus):
         self.client.ping()
 
     def publish(self, stream_name: str, payload: Dict[str, Any]) -> str:
+        from opentelemetry.propagate import inject
+        headers = {}
+        inject(headers)
+        if "traceparent" in headers:
+            payload["_traceparent"] = headers["traceparent"]
+
         # Convert nested dicts to JSON strings for Redis hash compatibility
         flat_payload = {k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in payload.items()}
         return self.client.xadd(stream_name, flat_payload)

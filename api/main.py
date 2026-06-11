@@ -79,6 +79,11 @@ app = FastAPI(
 # --- PRODUCTION OBSERVABILITY ---
 Instrumentator().instrument(app).expose(app)
 
+from src.infrastructure.tracing import init_tracing
+init_tracing("hpe-control-plane-api")
+
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+FastAPIInstrumentor.instrument_app(app)
 
 # Configure CORS
 import os

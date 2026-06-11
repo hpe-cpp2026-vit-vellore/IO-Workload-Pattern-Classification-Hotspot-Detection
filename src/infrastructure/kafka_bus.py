@@ -29,6 +29,13 @@ class KafkaBus(EventBus):
     def publish(self, stream_name: str, payload: Dict[str, Any]) -> str:
         """Publish an event to a Kafka Topic."""
         msg_id = str(uuid.uuid4())
+        
+        from opentelemetry.propagate import inject
+        headers = {}
+        inject(headers)
+        if "traceparent" in headers:
+            payload["_traceparent"] = headers["traceparent"]
+
         # Flatten and serialize payload
         flat_payload = {k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in payload.items()}
         

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # Security
     api_key_secret: str = "super-secret-local-key"
 
+    # OpenTelemetry Tracing
+    enable_tracing: bool = True
+    otel_exporter_otlp_endpoint: str = "http://localhost:4317"
+
     # Master Admin Credentials (Injected via K8s Secrets in Prod)
     master_admin_user: str = "admin"
     # Default bcrypt hash for "hpe_admin_2026" for local testing fallback

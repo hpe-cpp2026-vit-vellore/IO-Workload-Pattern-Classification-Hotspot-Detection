@@ -61,4 +61,8 @@ httpx>=0.24.0
 alembic==1.13.1
 python-json-logger==2.0.7
 
-
+# Observability / Distributed Tracing
+opentelemetry-api>=1.24.0
+opentelemetry-sdk>=1.24.0
+opentelemetry-exporter-otlp>=1.24.0
+opentelemetry-instrumentation-fastapi>=0.45b0
