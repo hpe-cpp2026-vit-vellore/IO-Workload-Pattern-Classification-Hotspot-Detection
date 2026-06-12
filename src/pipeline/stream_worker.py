@@ -490,32 +490,32 @@ def run_worker():
                                         logger.error(f"Decision engine evaluation failed for {volume_id} at {timestamp_str}: {ex}")
                                         eval_span.record_exception(ex)
 
-                        # E. Write to history list (rolling window of last 100 entries per volume)
-                        # Serializing timestamp as string
-                        history_event = dict(event)
-                        history_event["timestamp"] = timestamp_str
-                        history_json = json.dumps(history_event)
-                        
-                        pipe.lpush(f"volume:{volume_id}:history", history_json)
-                        pipe.ltrim(f"volume:{volume_id}:history", 0, 99)
+                            # E. Write to history list (rolling window of last 100 entries per volume)
+                            # Serializing timestamp as string
+                            history_event = dict(event)
+                            history_event["timestamp"] = timestamp_str
+                            history_json = json.dumps(history_event)
+                            
+                            pipe.lpush(f"volume:{volume_id}:history", history_json)
+                            pipe.ltrim(f"volume:{volume_id}:history", 0, 99)
 
-                        # F. Acknowledge message processing completion
-                        pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
+                            # F. Acknowledge message processing completion
+                            pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
 
-                    except Exception as poison_err:
-                        # --- POISON PILL CATCH-ALL ---
-                        # Any uncaught exception in the processing pipeline lands here.
-                        # Route to DLQ, acknowledge to prevent infinite redelivery, continue.
-                        logger.error(
-                            "Poison pill detected for message %s: %s. Routing to DLQ.",
-                            msg_id, poison_err
-                        )
-                        try:
-                            r.publish_dlq(raw_payload_str, f"Uncaught processing error: {poison_err}")
-                        except Exception:
-                            pass  # DLQ publish itself failed; already logged inside publish_dlq
-                        pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
-                        continue
+                        except Exception as poison_err:
+                            # --- POISON PILL CATCH-ALL ---
+                            # Any uncaught exception in the processing pipeline lands here.
+                            # Route to DLQ, acknowledge to prevent infinite redelivery, continue.
+                            logger.error(
+                                "Poison pill detected for message %s: %s. Routing to DLQ.",
+                                msg_id, poison_err
+                            )
+                            try:
+                                r.publish_dlq(raw_payload_str, f"Uncaught processing error: {poison_err}")
+                            except Exception:
+                                pass  # DLQ publish itself failed; already logged inside publish_dlq
+                            pipe.xack("telemetry:stream", "cg_control_plane", msg_id)
+                            continue
 
                 if last_ts is not None:
                     try:

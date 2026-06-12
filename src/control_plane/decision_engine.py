@@ -246,28 +246,27 @@ class DecisionEngine:
 
         # 4. Check rate limits and concurrency for migrations
         if action_type == "migrate":
-            # Concurrent migrations limit check
+            # C            # Enforce max concurrent migrations and max rate
             active_migrations = sum(
                 1 for act in self.monitor.actions.values()
-                if act["status"] == "monitoring" and act["action_state"]["action"] == "migrate"
+                if act.get("status") == "monitoring" and act.get("action_state", {}).get("action") == "migrate"
             )
+            
             if active_migrations >= self.max_concurrent_migrations:
                 logger.warning(
-                    "Migration limit reached. Active: %d (max: %d). Queuing volume %s migration.",
-                    active_migrations, self.max_concurrent_migrations, volume_id
+                    f"Max concurrent migrations ({self.max_concurrent_migrations}) reached. "
+                    f"Queueing migration for {volume_id}."
                 )
-                self.action_queue.append({
-                    "volume_id": volume_id,
-                    "action_choice": best_choice,
-                    "timestamp": timestamp
-                })
-                return {"status": "queued", "reason": "concurrent_limit"}
+                self.action_queue.append({"volume_id": volume_id, "timestamp": timestamp, "action_choice": best_choice})
+                action_state = {"status": "queued", "target_node": best_choice.get("target_node")}
+                exec_record = {"volume_id": volume_id, "timestamp": timestamp, "action": action_type, "status": "queued"}
+                self.action_history.append(exec_record)
+                return exec_record
 
-            # Rate limit (per hour) check
             one_hour_ago = timestamp - pd.Timedelta(hours=1)
             recent_moves = sum(
                 1 for act in self.action_history
-                if act["timestamp"] >= one_hour_ago and act["action"] == "migrate"
+                if act.get("timestamp", pd.Timestamp.min) >= one_hour_ago and act.get("action") == "migrate"
             )
             if recent_moves >= self.max_moves_per_hour:
                 logger.warning(
@@ -348,13 +347,13 @@ class DecisionEngine:
         # Filter active migrations
         active_migrations = sum(
             1 for act in self.monitor.actions.values()
-            if act["status"] == "monitoring" and act["action_state"]["action"] == "migrate"
+            if act["status"] == "monitoring" and act.get("action_state", {}).get("action") == "migrate"
         )
         
         one_hour_ago = timestamp - pd.Timedelta(hours=1)
         recent_moves = sum(
             1 for act in self.action_history
-            if act["timestamp"] >= one_hour_ago and act["action"] == "migrate"
+            if act["timestamp"] >= one_hour_ago and act.get("action") == "migrate"
         )
 
         still_queued = []
