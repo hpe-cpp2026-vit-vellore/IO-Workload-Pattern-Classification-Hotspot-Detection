@@ -9,6 +9,10 @@ This repository contains an intelligent, predictive Storage Control Plane design
 - 🧠 **Predictive Actuation:** Calculates "Days-to-Fill" (DTF) and simulates multi-volume rebalancing ROI without dropping telemetry frames.
 - 🛡️ **Production Grade:** Includes Prometheus metrics, K8s Liveness/Readiness probes, and an abstract `EventBus` dependency injection layer.
 
+## Architecture
+
+For a comprehensive system architecture diagram and production deployment details, see the [Production Architecture Guide](docs/production_architecture.md).
+
 > 📖 **Evaluators:** Please review our [Production Architecture Roadmap](docs/production_architecture.md) and the Kubernetes manifests in `deploy/k8s/` to see how this system scales to 10,000+ enterprise storage arrays.
 
 ## Local Dashboard Runbook

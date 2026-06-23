@@ -2,6 +2,12 @@
 
 To bridge the gap between our local blueprint prototype and a highly available HPE Datacenter deployment, this system is engineered with a **Dual-Track Architecture**. Our core business logic is 100% decoupled from its infrastructure via the 12-Factor App methodology.
 
+## System Architecture Overview
+
+![System Architecture](images/architecture_diagram.png)
+
+The diagram above illustrates the complete end-to-end architecture of our IO Workload Pattern Classification and Hotspot Detection system, showing the interaction between telemetry ingestion, ML inference pipeline, control plane decision engine, and the dashboard interface.
+
 ## 1. The Local Prototype (Current State)
 * **Compute:** Docker Compose (Single Node)
 * **Message Bus:** Redis Streams (via `RedisBus` wrapper)
