@@ -40,7 +40,7 @@ apply_custom_css()
 # Render standard sidebar
 health = render_sidebar_telemetry()
 if not health:
-    st.error("API Connection Offline.")
+    st.error(f"API Connection Offline. Debug: {st.session_state.get('last_api_error', 'No exception recorded')}")
     st.stop()
 
 # --- Page Headers ---
@@ -298,18 +298,25 @@ with tab_history:
         display_rows = []
         for _, row in hist_df.iterrows():
             ts_str = row["timestamp"].strftime("%Y-%m-%d %H:%M:%S") if isinstance(row["timestamp"], pd.Timestamp) else str(row["timestamp"])
-            choice = row.get("choice") or {}
+            
+            # Safely handle the DataFrame parsing of dictionary columns where NaNs can be cast as floats
+            action_state = row.get("action_state")
+            if not isinstance(action_state, dict):
+                action_state = {}
+                
             details = ""
-            action_name = row.get("action", "—")
+            action_name = action_state.get("action", row.get("action", "—"))
             
             if action_name == "migrate":
-                details = f"Target Node: {choice.get('target_node')}"
+                details = f"Target Node: {action_state.get('target_node')}"
             elif action_name == "qos":
-                details = f"IOPS Limit: {choice.get('iops_limit')}"
+                details = f"IOPS Limit: {action_state.get('new_iops_limit', action_state.get('iops_limit'))}"
             elif action_name == "tier_change":
-                details = f"New Tier: {choice.get('new_tier')}"
+                details = f"New Tier: {action_state.get('new_tier')}"
             elif action_name == "reschedule_job":
-                details = f"Workload: {choice.get('workload_type')}"
+                details = f"Workload: {action_state.get('workload_type')}"
+            elif action_name == "autoscale_add_node":
+                details = f"New Node: {row.get('node_id')} (Reason: {row.get('reason')})"
                 
             display_rows.append({
                 "Time": ts_str,

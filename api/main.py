@@ -600,48 +600,8 @@ def _append_feature_rows(rows: List[Dict[str, Any]]) -> None:
     except Exception as e:
         logger.error("_append_feature_rows failed: %s", e)
 
-async def _analyze_and_cache_volume(volume_id: str, ts: pd.Timestamp) -> None:
-    """Run heavier per-volume inference outside the ingestion hot path."""
-    global analysis_tasks, hub, engine, use_redis
-    try:
-        if hub is not None:
-            analysis = await asyncio.to_thread(hub.analyze_volume, volume_id, ts)
-            cached_analysis[volume_id] = analysis
-            
-            if engine is not None and engine.enabled:
-                action_result = await asyncio.to_thread(engine.evaluate_volume, volume_id, ts, analysis)
-                if action_result:
-                    _persist_control_plane_state()
-                    if use_redis:
-                        _persist_topology_to_redis(volume_id)
-                
-                queued_results = await asyncio.to_thread(engine.process_queued_actions, ts)
-                if queued_results:
-                    if queued_results.get("migrations") or queued_results.get("autoscale"):
-                        _persist_control_plane_state()
-                        if use_redis:
-                            for q_res in queued_results.get("migrations", []):
-                                _persist_topology_to_redis(q_res["volume_id"])
-    except Exception as e:
-        logger.error("Background analysis failed for %s at %s: %s", volume_id, ts, e)
-    finally:
-        analysis_tasks.pop(volume_id, None)
-
-def _schedule_volume_analysis(volume_id: str, ts: pd.Timestamp) -> None:
-    """Throttle background analysis so telemetry ingestion keeps the API responsive."""
-    now = time.time()
-    if now - last_analyzed_time.get(volume_id, 0.0) < 30.0:
-        return
-    task = analysis_tasks.get(volume_id)
-    if task is not None and not task.done():
-        return
-
-    last_analyzed_time[volume_id] = now
-    try:
-        analysis_tasks[volume_id] = asyncio.create_task(_analyze_and_cache_volume(volume_id, ts))
-    except RuntimeError:
-        # Fallback when there is no running event loop (e.g. during synchronous unit tests)
-        pass
+def _schedule_volume_analysis(volume_id: str, ts):
+    pass
 
 async def handle_tcp_client(reader, writer):
     """TCP Handler for playback agent streaming metrics directly to FastAPI when Redis is offline."""
@@ -777,6 +737,22 @@ def _load_control_plane_state():
                 monitors = data.get("active_monitors", {})
                 autoscale_state = data.get("autoscale_state", {})
                 
+                # Ensure all historical actions exist in monitors
+                if history:
+                    for act in history:
+                        aid = act["action_id"]
+                        if aid not in monitors:
+                            monitors[aid] = {
+                                "action_state": act.get("action_state", {}),
+                                "pre_latency": 0.0,
+                                "current_latency": 0.0,
+                                "status": act.get("status", "success"),
+                                "timestamp": act["timestamp"],
+                                "elapsed_minutes": 5.0
+                            }
+                
+                logger.info(f"DEBUG: monitors length after reconstruction is {len(monitors)}")
+
                 # Deserialize timestamps
                 for act in history:
                     act["timestamp"] = pd.to_datetime(act["timestamp"])
@@ -789,8 +765,10 @@ def _load_control_plane_state():
                     engine.last_autoscale_time = pd.to_datetime(last_autoscale) if last_autoscale else None
                 if monitor is not None:
                     monitor.actions = monitors
+                    logger.info(f"DEBUG: monitor.actions set to length {len(monitor.actions)}")
                     monitor.total_actions = max(len(monitors), len(history))
                     monitor.rolled_back_count = sum(1 for m in monitors.values() if m["status"] == "rolled_back")
+
             logger.info("Successfully loaded rebalance history from JSON file.")
         except Exception as e:
             logger.error("Failed to load rebalance history from JSON file: %s", e)
@@ -804,6 +782,10 @@ def _load_control_plane_state():
                     act["timestamp"] = pd.to_datetime(act["timestamp"])
                 if engine is not None:
                     engine.action_history = history
+            else:
+                # Redis is empty, but we might have loaded JSON data! Push it to Redis!
+                logger.info("Redis history is empty. Persisting JSON fallback data to Redis.")
+                _persist_control_plane_state()
             
             raw_monitors = r.hgetall("control_plane:active_monitors")
             if raw_monitors:
@@ -1027,7 +1009,7 @@ async def startup_event():
     # Initialize monitor with safety watchdogs and circuit breakers
     monitor = ActionMonitor(
         rollback_threshold_pct=hub.policy.get("safety_guardrails", {}).get("rollback_if_target_latency_increases_pct", 20.0),
-        rollback_timeout_minutes=hub.policy.get("safety_guardrails", {}).get("rollback_timeout_minutes", 5.0),
+        rollback_timeout_minutes=hub.policy.get("safety_guardrails", {}).get("rollback_timeout_minutes", 15.0),
         stall_timeout_seconds=60.0,  # 1 minute safety watchdog for testing/demo
         max_rollback_rate_pct=1.0   # Success Criteria 4 threshold
     )
@@ -1196,7 +1178,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
 
 @app.get("/health", status_code=status.HTTP_200_OK)
-def get_health():
+async def get_health():
     """Simple health check endpoint."""
     return {
         "status": "healthy" if hub is not None else "starting",
@@ -1222,13 +1204,13 @@ def get_health():
 
 
 @app.get("/telemetry/status", status_code=status.HTTP_200_OK)
-def get_telemetry_status():
+async def get_telemetry_status():
     """Inspect API-owned live telemetry state without relying on dashboard pages."""
     return live_state.status(get_expected_volume_count())
 
 
 @app.get("/kpi", status_code=status.HTTP_200_OK)
-def get_kpi():
+async def get_kpi():
     """Aggregate KPIs across the entire storage pool for the dashboard overview."""
     if hub is None:
         return {
@@ -1268,15 +1250,36 @@ def get_kpi():
         source = "historical_parquet"
         live_volume_count = 0
 
+    
     mon_summary = {
         "total_actions": 0,
         "rolled_back_count": 0,
         "rollback_rate_pct": 0.0,
     }
-    if monitor is not None:
-        mon_summary = monitor.get_summary()
+    if use_redis and r is not None:
+        try:
+            history = r.get_latest_state("control_plane:action_history") or []
+            total_actions = len(history)
+            
+            import json
+            raw_monitors = r.hgetall("control_plane:active_monitors") or {}
+            rolled_back = 0
+            for raw_mon in raw_monitors.values():
+                mon = json.loads(raw_mon)
+                if mon.get("status") == "rolled_back":
+                    rolled_back += 1
+            
+            rate = (rolled_back / total_actions * 100.0) if total_actions > 0 else 0.0
+            mon_summary = {
+                "total_actions": total_actions,
+                "rolled_back_count": rolled_back,
+                "rollback_rate_pct": rate
+            }
+        except Exception:
+            pass
 
     return {
+
         "avg_latency_us": round(avg_latency, 2),
         "total_iops": round(total_iops, 2),
         "total_actions": mon_summary["total_actions"],
@@ -1938,6 +1941,14 @@ def get_recommendations():
 @app.get("/policy", status_code=status.HTTP_200_OK)
 def get_policy():
     """View current active policies and thresholds."""
+    if use_redis and r is not None:
+        try:
+            cached_policy = r.get("control_plane:policy")
+            if cached_policy:
+                return json.loads(cached_policy)
+        except Exception as e:
+            logger.error("Failed to fetch policy from Redis: %s", e)
+            
     return engine.policy
 
 
@@ -1955,6 +1966,11 @@ def update_policy(req: PolicyUpdateRequest):
                 engine.circuit_breaker_tripped = False
                 engine.circuit_breaker_tripped_at = None
                 engine.circuit_breaker_reason = ""
+                if use_redis and r is not None:
+                    try:
+                        r.set("control_plane:circuit_breaker_reset", "1")
+                    except Exception as e:
+                        logger.error("Failed to set circuit breaker reset flag in Redis: %s", e)
         if "dry_run_mode" in rebalance:
             engine.dry_run_mode = rebalance["dry_run_mode"]
         if "min_hotspot_score_to_trigger" in rebalance:
@@ -1973,6 +1989,8 @@ def update_policy(req: PolicyUpdateRequest):
             monitor.rollback_threshold_pct = safety["rollback_if_target_latency_increases_pct"]
         if "rollback_timeout_minutes" in safety:
             monitor.rollback_timeout_minutes = safety["rollback_timeout_minutes"]
+        if "max_rollback_rate_pct" in safety:
+            engine.max_rollback_rate_pct = safety["max_rollback_rate_pct"]
             
     # Persist policy changes to Redis if active
     if use_redis and r is not None:
@@ -1986,6 +2004,14 @@ def update_policy(req: PolicyUpdateRequest):
 
 @app.get("/rebalance/circuit-breaker", status_code=200)
 def get_circuit_breaker_status():
+    if use_redis and r is not None:
+        try:
+            cb = r.get_latest_state("control_plane:circuit_breaker")
+            if cb:
+                return cb
+        except Exception as e:
+            logger.error("Failed to fetch circuit breaker status from Redis: %s", e)
+            
     if engine is None:
         return {"circuit_breaker_tripped": False, "engine_ready": False}
     return {
@@ -2009,6 +2035,13 @@ def reset_circuit_breaker():
     engine.circuit_breaker_tripped_at = None
     engine.circuit_breaker_reason = ""
     engine.enabled = engine.rebalance_policy.get("enabled", True)
+    
+    if use_redis and r is not None:
+        try:
+            r.set("control_plane:circuit_breaker_reset", "1")
+        except Exception as e:
+            logger.error("Failed to set circuit breaker reset flag in Redis: %s", e)
+            
     logger.info("Circuit breaker manually reset via API.")
     return {"status": "reset", "engine_enabled": engine.enabled}
 
@@ -2018,59 +2051,34 @@ def reset_circuit_breaker():
 @app.get("/rebalance/history", status_code=status.HTTP_200_OK)
 def get_rebalance_history():
     """Retrieve all rebalancing actions executed or logged."""
-    global engine, use_redis, r
-    if engine is None:
-        return []
-    
+
+    global use_redis, r
     if use_redis and r is not None:
-        _sync_monitors_from_redis()
-        
-    def _serialize_act(act):
-        serialized = {}
-        for k, v in act.items():
-            if isinstance(v, pd.Timestamp):
-                serialized[k] = v.isoformat()
-            elif isinstance(v, dict):
-                serialized[k] = _serialize_act(v)
-            elif isinstance(v, list):
-                serialized[k] = [
-                    _serialize_act(item) if isinstance(item, dict) else (item.isoformat() if isinstance(item, pd.Timestamp) else item)
-                    for item in v
-                ]
-            else:
-                serialized[k] = v
-        return serialized
-        
-    return [_serialize_act(act) for act in engine.action_history]
+        try:
+            history = r.get_latest_state("control_plane:action_history") or []
+            return history
+        except Exception:
+            return []
+    return []
 
 
 @app.get("/rebalance/monitors", status_code=status.HTTP_200_OK)
 def get_rebalance_monitors():
     """Retrieve active and historical action monitors."""
-    global monitor, use_redis, r
-    if monitor is None:
-        return {}
-        
+
+    global use_redis, r
     if use_redis and r is not None:
-        _sync_monitors_from_redis()
-        
-    def _serialize_mon(mon):
-        serialized = {}
-        for k, v in mon.items():
-            if isinstance(v, pd.Timestamp):
-                serialized[k] = v.isoformat()
-            elif isinstance(v, dict):
-                serialized[k] = _serialize_mon(v)
-            elif isinstance(v, list):
-                serialized[k] = [
-                    _serialize_mon(item) if isinstance(item, dict) else (item.isoformat() if isinstance(item, pd.Timestamp) else item)
-                    for item in v
-                ]
-            else:
-                serialized[k] = v
-        return serialized
-        
-    return {aid: _serialize_mon(mon) for aid, mon in monitor.actions.items()}
+        import json
+        try:
+            raw_monitors = r.hgetall("control_plane:active_monitors") or {}
+            monitors = {}
+            for aid, raw_mon in raw_monitors.items():
+                mon = json.loads(raw_mon)
+                monitors[aid] = mon
+            return monitors
+        except Exception:
+            return {}
+    return {}
 
 
 @app.post("/rebalance", status_code=status.HTTP_200_OK)

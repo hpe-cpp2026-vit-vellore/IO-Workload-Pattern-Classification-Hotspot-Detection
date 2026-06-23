@@ -15,7 +15,7 @@ rebalance_policy:
 
 safety_guardrails:
   rollback_if_target_latency_increases_pct: 20
-  rollback_timeout_minutes: 5
+  rollback_timeout_minutes: 15
   max_rollback_rate_pct: 1.0
 
 capacity_policy:

@@ -194,10 +194,17 @@ def apply_dark_theme(fig):
     return fig
 
 # --- API Fetch wrappers ---
-@st.cache_data(ttl=3000) # Cache the token
+
+# Use a global session to enable HTTP Keep-Alive and prevent TCP port exhaustion
+_session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
+_session.mount("http://", adapter)
+_session.mount("https://", adapter)
+
+@st.cache_data(ttl=1500) # Cache token for 25 mins (expires in 30 mins)
 def _get_auth_token(api_url: str) -> str:
     try:
-        response = requests.post(
+        response = _session.post(
             f"{api_url}/token", 
             data={"username": "admin", "password": "hpe_admin_2026"},
             timeout=5.0
@@ -209,14 +216,14 @@ def _get_auth_token(api_url: str) -> str:
     return ""
 
 def get_api_data(endpoint: str, params: dict = None, timeout: float = 5.0) -> Any:
-    """Helper to query local FastAPI endpoints."""
+    """Helper to query local FastAPI endpoints using Keep-Alive."""
     try:
         headers = {}
         if not endpoint.startswith("/health"):
             token = _get_auth_token(API_URL)
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-        response = requests.get(f"{API_URL}{endpoint}", params=params, headers=headers, timeout=timeout)
+        response = _session.get(f"{API_URL}{endpoint}", params=params, headers=headers, timeout=timeout)
         if response.status_code == 200:
             st.session_state["last_api_error"] = None
             return response.json()
@@ -227,27 +234,27 @@ def get_api_data(endpoint: str, params: dict = None, timeout: float = 5.0) -> An
         return None
 
 def post_api_data(endpoint: str, payload: dict) -> Any:
-    """Helper to post parameters to FastAPI endpoints."""
+    """Helper to post parameters to FastAPI endpoints using Keep-Alive."""
     try:
         headers = {}
         if not endpoint.startswith("/health"):
             token = _get_auth_token(API_URL)
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-        response = requests.post(f"{API_URL}{endpoint}", json=payload, headers=headers, timeout=5)
+        response = _session.post(f"{API_URL}{endpoint}", json=payload, headers=headers, timeout=15.0)
         return response.json() if response.status_code == 200 else {"detail": response.text}
     except Exception as e:
         return {"detail": str(e)}
 
 def put_api_data(endpoint: str, payload: dict) -> Any:
-    """Helper to update policy configurations at FastAPI endpoints."""
+    """Helper to update policy configurations at FastAPI endpoints using Keep-Alive."""
     try:
         headers = {}
         if not endpoint.startswith("/health"):
             token = _get_auth_token(API_URL)
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-        response = requests.put(f"{API_URL}{endpoint}", json=payload, headers=headers, timeout=5)
+        response = _session.put(f"{API_URL}{endpoint}", json=payload, headers=headers, timeout=15.0)
         return response.json() if response.status_code == 200 else {"detail": response.text}
     except Exception as e:
         return {"detail": str(e)}
@@ -311,8 +318,8 @@ def render_sidebar_telemetry():
         "</div>", unsafe_allow_html=True
     )
     
-    # Connection Check
-    health = get_api_data("/health", timeout=2.0)
+    # Connection Check (Increased timeout to 5.0 to survive heavy GIL-locked PyTorch simulations)
+    health = get_api_data("/health", timeout=5.0)
     if not health:
         st.sidebar.error("API Connection: UNREACHABLE")
         return None

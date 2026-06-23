@@ -257,9 +257,10 @@ class DecisionEngine:
                     f"Max concurrent migrations ({self.max_concurrent_migrations}) reached. "
                     f"Queueing migration for {volume_id}."
                 )
-                self.action_queue.append({"volume_id": volume_id, "timestamp": timestamp, "action_choice": best_choice})
+                action_id = str(uuid.uuid4())
+                self.action_queue.append({"volume_id": volume_id, "timestamp": timestamp, "action_choice": best_choice, "action_id": action_id})
                 action_state = {"status": "queued", "target_node": best_choice.get("target_node")}
-                exec_record = {"volume_id": volume_id, "timestamp": timestamp, "action": action_type, "status": "queued"}
+                exec_record = {"action_id": action_id, "volume_id": volume_id, "timestamp": timestamp, "action": action_type, "status": "queued", "action_state": action_state}
                 self.action_history.append(exec_record)
                 return exec_record
 
@@ -273,12 +274,17 @@ class DecisionEngine:
                     "Hourly migration rate limit reached. Recent moves: %d (max: %d). Queuing volume %s migration.",
                     recent_moves, self.max_moves_per_hour, volume_id
                 )
+                action_id = str(uuid.uuid4())
                 self.action_queue.append({
                     "volume_id": volume_id,
                     "action_choice": best_choice,
-                    "timestamp": timestamp
+                    "timestamp": timestamp,
+                    "action_id": action_id
                 })
-                return {"status": "queued", "reason": "rate_limit"}
+                action_state = {"status": "queued", "target_node": best_choice.get("target_node")}
+                exec_record = {"action_id": action_id, "volume_id": volume_id, "timestamp": timestamp, "action": action_type, "status": "queued", "action_state": action_state, "reason": "rate_limit"}
+                self.action_history.append(exec_record)
+                return exec_record
 
         # 5. Execute Action (or dry run)
         action_id = str(uuid.uuid4())
@@ -369,19 +375,32 @@ class DecisionEngine:
                 metrics_dict = self.hub.topology._volume_metrics.get(vol_id, {})
                 pre_latency = metrics_dict.get("avg_latency_us", 1000.0)
                 
-                action_id = str(uuid.uuid4())
+                action_id = task.get("action_id", str(uuid.uuid4()))
                 action_state = self.rebalancer.execute_migration(vol_id, best_choice["target_node"], self.hub.topology)
                 
-                exec_record = {
-                    "action_id": action_id,
-                    "volume_id": vol_id,
-                    "action": "migrate",
-                    "choice": best_choice,
-                    "timestamp": timestamp,
-                    "action_state": action_state,
-                    "status": "executed"
-                }
-                self.action_history.append(exec_record)
+                # Find and update existing queued record, or append a new one
+                exec_record = None
+                for record in self.action_history:
+                    if record.get("action_id") == action_id:
+                        record["action_state"] = action_state
+                        record["choice"] = best_choice
+                        record["status"] = "executed"
+                        record["timestamp"] = timestamp
+                        exec_record = record
+                        break
+                
+                if not exec_record:
+                    exec_record = {
+                        "action_id": action_id,
+                        "volume_id": vol_id,
+                        "action": "migrate",
+                        "choice": best_choice,
+                        "timestamp": timestamp,
+                        "action_state": action_state,
+                        "status": "executed"
+                    }
+                    self.action_history.append(exec_record)
+                    
                 self.monitor.register_action(
                     action_id=action_id,
                     action_state=action_state,

@@ -89,8 +89,21 @@ def _sync_policy_from_redis(r_client, engine_obj, monitor_obj):
             safety = policy.get("safety_guardrails", {})
             monitor_obj.rollback_threshold_pct = safety.get("rollback_if_target_latency_increases_pct", monitor_obj.rollback_threshold_pct)
             monitor_obj.rollback_timeout_minutes = safety.get("rollback_timeout_minutes", monitor_obj.rollback_timeout_minutes)
+            engine_obj.max_rollback_rate_pct = rebalance.get("max_rollback_rate_pct", engine_obj.max_rollback_rate_pct)
     except Exception as e:
         logger.warning("Error syncing policy from Redis: %s", e)
+
+    try:
+        reset_flag = r_client.get("control_plane:circuit_breaker_reset")
+        if reset_flag == "1":
+            logger.info("Received circuit breaker reset signal from Redis. Resetting.")
+            engine_obj.circuit_breaker_tripped = False
+            engine_obj.circuit_breaker_tripped_at = None
+            engine_obj.circuit_breaker_reason = ""
+            engine_obj.enabled = True
+            r_client.delete("control_plane:circuit_breaker_reset")
+    except Exception as e:
+        logger.warning("Error checking circuit breaker reset flag: %s", e)
 
 def _sync_control_plane_state_from_redis(r_client, engine_obj, monitor_obj):
     try:
@@ -158,6 +171,19 @@ def _persist_control_plane_state(r_client, engine_obj, monitor_obj):
         r_client.delete("control_plane:active_monitors")
         if serialized_monitors:
             r_client.hset("control_plane:active_monitors", mapping={aid: json.dumps(mon) for aid, mon in serialized_monitors.items()})
+
+        # Sync circuit breaker state to Redis
+        circuit_breaker = {
+            "circuit_breaker_tripped": engine_obj.circuit_breaker_tripped,
+            "tripped_at": engine_obj.circuit_breaker_tripped_at.isoformat() if engine_obj.circuit_breaker_tripped_at else None,
+            "reason": engine_obj.circuit_breaker_reason,
+            "current_rollback_rate_pct": monitor_obj.get_rollback_rate(),
+            "max_rollback_rate_pct": engine_obj.max_rollback_rate_pct,
+            "total_actions": monitor_obj.total_actions,
+            "engine_enabled": engine_obj.enabled,
+        }
+        r_client.set_state("control_plane:circuit_breaker", circuit_breaker)
+
     except Exception as e:
         logger.error("Failed to persist control plane state to Redis: %s", e)
 
@@ -335,8 +361,9 @@ def run_worker():
 
     # 4. Ingestion loop
     logger.info("Ingestion consumer group loop started. Listening for events...")
-    
     last_trim_time = time.time()
+    last_monitor_update_time = time.time()
+
     last_analyzed_time = {}
     last_processed_ts = None  # Track last event timestamp to detect playback resets
     
@@ -532,7 +559,49 @@ def run_worker():
 
             # Prevent live_features_df memory leak (trim df if it exceeds 15,000 rows, keeping last 200 per volume)
             current_time = time.time()
+
+            if last_ts is not None:
+                monitor_changed = False
+                for action_id, act in list(monitor.actions.items()):
+                    if act.get("status") == "monitoring":
+                        volume_id = act.get("action_state", {}).get("volume_id")
+                        if not volume_id:
+                            continue
+                        
+                        metrics_dict = hub.topology._volume_metrics.get(volume_id, {})
+                        current_latency = metrics_dict.get("avg_latency_us", 1000.0)
+                        
+                        # Calculate elapsed using the telemetry clock to support fast-forward playback
+                        start_ts = pd.to_datetime(act["timestamp"])
+                        if last_processed_ts is not None:
+                            elapsed = (pd.Timestamp(last_processed_ts) - start_ts).total_seconds() / 60.0
+                        else:
+                            elapsed = (pd.Timestamp.now() - start_ts).total_seconds() / 60.0
+                        
+                        if elapsed < 0:
+                            elapsed = 0.0
+                        
+                        new_status = monitor.update_metrics(
+                            action_id,
+                            current_latency,
+                            elapsed,
+                            rebalancer,
+                            hub.topology
+                        )
+                        if new_status != "monitoring":
+                            monitor_changed = True
+                            
+                            # Also update the history array so that `engine.action_history` has the right status
+                            for hist_act in engine.action_history:
+                                if hist_act.get("action_id") == action_id:
+                                    hist_act["status"] = new_status
+                                    break
+                                    
+                if monitor_changed:
+                    _persist_control_plane_state(r, engine, monitor)
+                    
             if len(hub.live_features_df) > 15000 and (current_time - last_trim_time > 60):
+
                 hub.live_features_df = hub.live_features_df.groupby("volume_id").tail(200).reset_index(drop=True)
                 last_trim_time = current_time
                 logger.info(f"Trimmed local live features dataframe. Size: {len(hub.live_features_df)} rows.")
