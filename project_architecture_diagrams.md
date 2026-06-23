@@ -4,9 +4,13 @@ Complete system architecture derived from line-by-line analysis of the full code
 
 ---
 
-## 1. High-Level System Block Diagram
+## 1. High-Level System Block Diagrams
 
-This diagram shows every container, module, and data store and how they connect.
+The system implements a **Dual-Track Architecture** allowing the same codebase to run locally or scale seamlessly to datacenters.
+
+### 1.1. Local Prototype System Block Diagram (Docker + Redis)
+
+This diagram shows the local orchestration using Docker Compose and Redis Streams.
 
 ```mermaid
 graph TB
@@ -58,6 +62,73 @@ graph TB
     style SW fill:#16213e,stroke:#0f3460,color:#ffffff
     style API fill:#1a1a2e,stroke:#7b2cbf,color:#ffffff
     style Dash fill:#16213e,stroke:#00e676,color:#ffffff
+```
+
+### 1.2. Datacenter Production System Block Diagram (Kubernetes + Kafka + Triton)
+
+This diagram shows the enterprise deployment target running on Kubernetes, leveraging Kafka for high-throughput ingestion, TimescaleDB for time-series persistence, and a disaggregated Triton/KServe inference serving pool.
+
+```mermaid
+graph TB
+    subgraph K8s["Kubernetes Production Cluster"]
+        direction TB
+        
+        subgraph TelGen["telemetry-playback (Replica: 1)"]
+            TP["telemetry_playback.py<br/>Reads telemetry data → publishes<br/>to Kafka Telemetry Topic"]
+        end
+        
+        subgraph KafkaNode["Apache Kafka Enterprise Broker"]
+            RS["telemetry-topic<br/>(Partitioned Ingestion)"]
+            DLQ["hpe_telemetry_dlq<br/>(Kafka Dead-Letter Topic)"]
+        end
+        
+        subgraph SW["stream-worker (Replicas: 3+)"]
+            SWP["stream_worker.py<br/>Consumer Group: cg_control_plane"]
+        end
+        
+        subgraph API["api-control-plane (FastAPI × 3-50 Pods HPA)"]
+            MAIN["api/main.py<br/>REST endpoints with JWT auth"]
+        end
+        
+        subgraph Dash["dashboard-ui (Streamlit Service)"]
+            HOME["Home.py"]
+            P1["1_Cluster_Overview.py"]
+            P2["2_Hotspot_Analytics.py"]
+            P3["3_Forecasting.py"]
+            P4["4_Control_Plane.py"]
+        end
+        
+        subgraph DB["TimescaleDB StatefulSet"]
+            TS["TimescaleClient<br/>Hypertable partition queries"]
+        end
+        
+        subgraph Serving["ML Serving Cluster (Triton / KServe)"]
+            T_LGB["LightGBM Classifier Model"]
+            T_ENS["Anomaly Ensemble Models"]
+            T_TFT["TFT Latency Forecaster"]
+            T_NB["N-BEATS Capacity Forecaster"]
+        end
+    end
+
+    TP -->|Kafka Producer| RS
+    RS -->|Kafka Consumer| SWP
+    SWP -->|gRPC / HTTP| Serving
+    SWP -->|INSERT / UPDATE| TS
+    SWP -.->|publish_dlq| DLQ
+    MAIN -->|SELECT / windowed queries| TS
+    MAIN -->|gRPC / HTTP| Serving
+    P1 -->|HTTP GET/PUT| MAIN
+    P2 -->|HTTP GET| MAIN
+    P3 -->|HTTP GET| MAIN
+    P4 -->|HTTP GET/PUT/POST| MAIN
+
+    style K8s fill:#0d1117,stroke:#30363d,color:#c9d1d9
+    style KafkaNode fill:#1a1a2e,stroke:#e94560,color:#ffffff
+    style SW fill:#16213e,stroke:#0f3460,color:#ffffff
+    style API fill:#1a1a2e,stroke:#7b2cbf,color:#ffffff
+    style Dash fill:#16213e,stroke:#00e676,color:#ffffff
+    style DB fill:#1a1a2e,stroke:#00e676,color:#ffffff
+    style Serving fill:#1a1a2e,stroke:#ff9100,color:#ffffff
 ```
 
 ---
@@ -126,15 +197,16 @@ Shows the full observe → decide → act → monitor feedback loop.
 ```mermaid
 graph TB
     subgraph Observe["OBSERVE Layer"]
-        TEL["Telemetry Stream<br/>(Redis Streams)"]
+        TEL["Telemetry Stream<br/>(Redis Streams / Kafka)"]
         PARSE["TelemetryParser<br/>C++ binary / Python fallback<br/>IQR outlier clipping"]
         TOPO["TopologyGraph<br/>(NetworkX)<br/>Nodes ↔ Volumes<br/>Tier assignments"]
     end
 
     subgraph Decide["DECIDE Layer"]
-        IH["InferenceHub<br/>analyze_volume()"]
+        IH["InferenceHub / RemoteClient<br/>analyze_volume()"]
         DE["DecisionEngine<br/>evaluate_volume()"]
-        SIM["simulate_actions()<br/>migrate | qos | tier_change<br/>| reschedule_job"]
+        SIM["What-If Simulator<br/>(simulator.py × simulate_actions())"]
+        CPL["CapacityPlanner<br/>(capacity_planner.py × generate_recs())"]
         CB["Circuit Breaker<br/>Rollback rate > 1%<br/>→ DISABLE engine"]
     end
 
@@ -152,8 +224,9 @@ graph TB
     TEL --> PARSE --> IH
     TOPO --> IH
     IH -->|hotspot_score ≥ threshold| DE
-    DE --> SIM
-    SIM -->|best action| DE
+    DE -->|evaluate actions| SIM
+    SIM -->|simulation ROI| DE
+    CPL -->|autoscaling recommendations| DE
     DE -->|rate limits OK| REB
     DE -.->|rate limit hit| Q["Action Queue"]
     Q -.->|process_queued_actions| REB
@@ -461,6 +534,7 @@ graph LR
 
     subgraph ControlPlane["src/control_plane/"]
         IHB["inference_hub.py"]
+        RIC["remote_inference_client.py"]
         DEN["decision_engine.py"]
         RBL["rebalancer.py"]
         MON["monitor.py"]
@@ -504,6 +578,8 @@ graph LR
     IHB --> TFM
     IHB --> TFF
     IHB --> DMF
+    RIC --> TG
+    RIC --> TC
     DEN --> IHB
     DEN --> RBL
     DEN --> MON
@@ -519,6 +595,7 @@ graph LR
 
     %% API deps
     APM --> IHB
+    APM --> RIC
     APM --> DEN
     APM --> MON
     APM --> RBL
@@ -550,29 +627,42 @@ graph LR
 
 | Layer | File | Lines | Role |
 |-------|------|------:|------|
-| **Infrastructure** | [interfaces.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/interfaces.py) | 39 | `EventBus` abstract base class |
-| | [redis_bus.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/redis_bus.py) | 88 | Redis Streams publish/subscribe + DLQ |
-| | [security.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/security.py) | ~50 | JWT token generation/validation |
-| | [tracing.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/tracing.py) | ~60 | OpenTelemetry span propagation |
-| **Pipeline** | [telemetry_parser.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/telemetry_parser.py) | 351 | C++/Python hybrid JSON parser + IQR outlier clipping |
-| | [topology_graph.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/topology_graph.py) | ~600 | NetworkX graph: nodes ↔ volumes, tier mgmt, placement |
-| | [stream_worker.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/stream_worker.py) | 618 | Main ingestion loop: consume → parse → infer → decide → persist |
-| **ML Models** | [lightgbm_tuned.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/classifier/lightgbm_tuned.py) | ~400 | Optuna-tuned LightGBM 5-class workload classifier |
-| | [arf_adwin.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/classifier/arf_adwin.py) | ~300 | River ARF + ADWIN drift detection streaming classifier |
-| | [statistical_detector.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/statistical_detector.py) | ~350 | Per-volume 24h rolling z-score anomaly detector |
-| | [isolation_forest.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/isolation_forest.py) | ~550 | Sklearn Isolation Forest with 10-feature vectors |
-| | [lstm_autoencoder.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/lstm_autoencoder.py) | ~1000 | PyTorch LSTM Autoencoder (12-step × 10-feature) |
-| | [ensemble_detector.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/ensemble_detector.py) | 1121 | Weighted fusion + consensus gate + meta-learner |
-| | [noisy_neighbor.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/noisy_neighbor.py) | ~550 | Aggressor-victim detection via co-located node scan |
-| | [nbeats_model.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/nbeats_model.py) | ~360 | Neural Basis Expansion for capacity forecasting |
-| | [tft_model.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/tft_model.py) | ~200 | Temporal Fusion Transformer architecture |
-| | [tft_forecaster.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/tft_forecaster.py) | ~530 | TFT data prep + hourly aggregation + scaler |
-| **Control Plane** | [inference_hub.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/inference_hub.py) | 578 | Central ML coordinator: loads all models, runs analyze_volume() |
-| | [decision_engine.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/decision_engine.py) | 530 | Policy evaluation, action simulation, rate limiting, circuit breaker |
-| | [rebalancer.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/rebalancer.py) | 228 | Execute/rollback migrations, QoS, tier changes on topology |
-| | [monitor.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/monitor.py) | 269 | Post-action latency tracking, rollback triggering, watchdog thread |
-| | [actuators.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/actuators.py) | 278 | Stub/CSI/ArrayAPI actuator abstraction for physical moves |
-| **API** | [main.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/api/main.py) | 2381 | FastAPI app: 40+ endpoints, JWT auth, CORS, Redis sync |
-| **Dashboard** | [1_Cluster_Overview.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/pages/1_Cluster_Overview.py) | 337 | Live KPIs, SVG sparklines, volume status table |
-| | [2_Hotspot_Analytics.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/pages/2_Hotspot_Analytics.py) | 419 | Topology map, SHAP, diagnostics, noisy neighbors, ML perf |
-| | [4_Control_Plane.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/pages/4_Control_Plane.py) | 330 | Policy config, manual overrides, active monitors, history |
+| **Infrastructure** | [interfaces.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/interfaces.py) | 38 | `EventBus` abstract base class |
+| | [redis_bus.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/redis_bus.py) | 87 | Redis Streams publish/subscribe + DLQ |
+| | [kafka_bus.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/kafka_bus.py) | 108 | Apache Kafka consumer/producer event bus |
+| | [bus_factory.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/bus_factory.py) | 17 | Factory to instantiate Redis or Kafka event bus |
+| | [timescale_client.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/timescale_client.py) | 81 | TimescaleDB hypertable query and ingestion wrapper |
+| | [security.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/security.py) | 43 | JWT token generation/validation |
+| | [tracing.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/infrastructure/tracing.py) | 54 | OpenTelemetry span propagation |
+| **Pipeline** | [telemetry_parser.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/telemetry_parser.py) | 350 | C++/Python hybrid JSON parser + IQR outlier clipping |
+| | [topology_graph.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/topology_graph.py) | 476 | NetworkX graph: nodes ↔ volumes, tier mgmt, placement |
+| | [preprocessor.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/preprocessor.py) | 248 | Telemetry scaling, rolling feature computation, robust bounds |
+| | [data_loader.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/data_loader.py) | 94 | Dataset split and batch loading for forecasters |
+| | [stream_worker.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/pipeline/stream_worker.py) | 617 | Main ingestion loop: consume → parse → infer → decide → persist |
+| **ML Models** | [lightgbm_tuned.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/classifier/lightgbm_tuned.py) | 386 | Optuna-tuned LightGBM 5-class workload classifier |
+| | [arf_adwin.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/classifier/arf_adwin.py) | 319 | River ARF + ADWIN drift detection streaming classifier |
+| | [statistical_detector.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/statistical_detector.py) | 416 | Per-volume 24h rolling z-score anomaly detector |
+| | [isolation_forest.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/isolation_forest.py) | 590 | Sklearn Isolation Forest with 10-feature vectors |
+| | [lstm_autoencoder.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/lstm_autoencoder.py) | 924 | PyTorch LSTM Autoencoder (12-step × 10-feature) |
+| | [ensemble_detector.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/ensemble_detector.py) | 1120 | Weighted fusion + consensus gate + meta-learner |
+| | [noisy_neighbor.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/anomaly/noisy_neighbor.py) | 498 | Aggressor-victim detection via co-located node scan |
+| | [nbeats_model.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/nbeats_model.py) | 392 | Neural Basis Expansion for capacity forecasting |
+| | [tft_model.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/tft_model.py) | 203 | Temporal Fusion Transformer architecture |
+| | [tft_forecaster.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/tft_forecaster.py) | 526 | TFT data prep + hourly aggregation + scaler |
+| | [demand_forecaster.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/demand_forecaster.py) | 263 | IOPS and throughput quantile regression model |
+| | [dtf_forecaster.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/models/forecasting/dtf_forecaster.py) | 603 | Days-to-fill capacity forecasting training/prediction |
+| **Control Plane** | [inference_hub.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/inference_hub.py) | 577 | Central ML coordinator: loads all models, runs analyze_volume() |
+| | [remote_inference_client.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/remote_inference_client.py) | 152 | Client proxy for disaggregated inference serving (GPU clusters) |
+| | [decision_engine.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/decision_engine.py) | 529 | Policy evaluation, action simulation, rate limiting, circuit breaker |
+| | [rebalancer.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/rebalancer.py) | 227 | Execute/rollback migrations, QoS, tier changes on topology |
+| | [monitor.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/monitor.py) | 268 | Post-action latency tracking, rollback triggering, watchdog thread |
+| | [actuators.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/actuators.py) | 277 | Stub/CSI/ArrayAPI actuator abstraction for physical moves |
+| | [simulator.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/simulator.py) | 217 | What-If Simulator for policy migration/shaping evaluations |
+| | [capacity_planner.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/src/control_plane/capacity_planner.py) | 233 | Generates capacity plan, pool headroom, and autoscale recs |
+| **API** | [main.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/api/main.py) | 2380 | FastAPI app: 37 active endpoints, JWT auth, CORS, Redis sync |
+| **Dashboard** | [Home.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/Home.py) | 138 | Streamlit landing page and credentials configuration |
+| | [utils.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/utils.py) | 393 | Dashboard HTTP API client and SVG sparkline helpers |
+| | [1_Cluster_Overview.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/pages/1_Cluster_Overview.py) | 336 | Live KPIs, SVG sparklines, volume status table |
+| | [2_Hotspot_Analytics.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/pages/2_Hotspot_Analytics.py) | 418 | Topology map, SHAP, diagnostics, noisy neighbors, ML perf |
+| | [3_Forecasting.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/pages/3_Forecasting.py) | 136 | Capacity/latency forecaster charts and days-to-fill UI |
+| | [4_Control_Plane.py](file:///home/akash-t-s-m/projects-may/akash.t.s.m-projects/IO-Workload-Pattern-Classification-Hotspot-Detection/dashboard/pages/4_Control_Plane.py) | 329 | Policy config, manual overrides, active monitors, history |
