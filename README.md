@@ -13,8 +13,8 @@ Get the system running with one command:
 git clone <repo-url>
 cd IO-Workload-Pattern-Classification-Hotspot-Detection
 
-# 2. Start all services with Docker Compose
-docker compose up -d
+# 2. Build and start all services with Docker Compose
+docker compose up --build -d
 
 # 3. Open the dashboard in your browser
 open http://localhost:8501
@@ -238,6 +238,7 @@ python src/data/data_generator.py
 python src/data/feature_engineer.py
 
 # Train all ML models and export artifacts
+# (This internally runs preprocessing via src/pipeline/preprocessor.py)
 python scripts/train_all.py
 ```
 
@@ -320,6 +321,8 @@ python src/data/feature_engineer.py
 **Output:**
 - `data/processed/io_features.parquet` - Processed features ready for training
 - Chronological split: 21 days training, 9 days testing
+
+> **Note:** Preprocessing (scaling, normalization) is handled automatically by `src/pipeline/preprocessor.py` during model training via `scripts/train_all.py`.
 
 ---
 
@@ -659,78 +662,14 @@ Comprehensive documentation is available in the `docs/` directory:
 - **[Project Report](docs/project_report.md)** - Full technical report covering ML methodologies, system design, and evaluation metrics
 - **[Architecture Diagram](docs/images/architecture_diagram.png)** - Visual system architecture with all components and data flows
 
----
+### Additional Technical Documentation:
 
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these guidelines:
-
-### Development Workflow:
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes with clear, atomic commits
-4. Write or update tests for new functionality
-5. Ensure all tests pass (`pytest tests/ -v`)
-6. Update documentation as needed
-7. Commit your changes (`git commit -m 'Add amazing feature'`)
-8. Push to your branch (`git push origin feature/amazing-feature`)
-9. Open a Pull Request with a detailed description
-
-### Code Style:
-- **Python**: Follow PEP 8 style guide
-- **Type Hints**: Use type annotations for all function signatures
-- **Docstrings**: Use Google-style docstrings for classes and public methods
-- **Testing**: Maintain >80% code coverage for new code
-- **Commits**: Use conventional commit messages (`feat:`, `fix:`, `docs:`, `refactor:`, etc.)
-
-### Testing Requirements:
-```bash
-# Run tests with coverage
-pytest tests/ -v --cov=src --cov=api
-
-# Run linting
-pylint src/ api/
-
-# Format code
-black src/ api/ tests/
-```
-
-### Areas for Contribution:
-- Additional ML models (transformer-based classifiers, attention mechanisms)
-- Enhanced visualization dashboards
-- Integration with real storage arrays (HPE Primera, Nimble, 3PAR)
-- Performance optimizations
-- Additional actuator implementations (REST APIs, CLI tools)
-- Documentation improvements and tutorials
-
----
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
-
----
-
-## 🙏 Acknowledgments
-
-This project was developed as part of the HPE Blueprint initiative for intelligent storage management.
-
-**Key Technologies:**
-- **ML Frameworks:** scikit-learn, LightGBM, PyTorch, River
-- **Deep Learning:** N-BEATS, Temporal Fusion Transformer, LSTM Autoencoders
-- **Infrastructure:** FastAPI, Streamlit, Redis, Apache Kafka, TimescaleDB
-- **Orchestration:** Docker, Kubernetes, Helm
-- **Observability:** Prometheus, Grafana, OpenTelemetry, MLflow
-
----
-
-## 📬 Contact & Support
-
-For questions, issues, or enterprise support inquiries, please:
-- Open an issue in this repository
-- Review existing documentation in `docs/`
-- Check the troubleshooting section above
-
----
-
-**Built with ❤️ for intelligent storage automation**
+- **[Complete Architecture Diagrams](project_architecture_diagrams.md)** - Detailed Mermaid diagrams covering:
+  - High-level system block diagram (Docker containers and data flows)
+  - ML model hierarchy (9 models and InferenceHub integration)
+  - Control plane closed-loop (Observe → Decide → Act → Monitor)
+  - Sequence diagrams (telemetry event to action, 3 phases)
+  - Dashboard ↔ API interaction flows
+  - Data ingestion pipeline (raw data to trained models)
+  - Module dependency map (all Python imports)
+  - File-to-module summary table
