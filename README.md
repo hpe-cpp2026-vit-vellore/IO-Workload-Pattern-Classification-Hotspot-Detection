@@ -2,6 +2,9 @@
 
 ### *Enterprise-grade Autonomous Storage Control Plane for SLO Compliance, Predictive Rebalancing, and Capacity Planning.*
 
+### 🎥 Demo Video
+Watch the system in action: **[HPE Storage Control Plane Demo Video](https://drive.google.com/file/d/19utK1RhTg2t0ZZEKohM8nuGWzu9virm6/view)**
+
 ---
 
 ## ⚡ Quick Start (2 Minutes)
